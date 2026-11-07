@@ -447,6 +447,8 @@ def main() -> None:
                          "Default: first model in EVAL_MODELS; 'any' accepts any model")
     ap.add_argument("--check-evidence", action="store_true", help="check that quotes are in transcript[turn-1]")
     ap.add_argument("--validate", action="store_true", help="validate the written file")
+    ap.add_argument("--expect-ok", action="store_true",
+                    help="exit with code 3 and a loud warning if any record has status=error")
     args = ap.parse_args()
 
     records, source_path = load_source(args)
@@ -481,9 +483,22 @@ def main() -> None:
         print(f"цитаты: совпало {rep['matched']} из {rep['total']}")
         for m in rep["mismatches"]:
             print(f"  {m['conversation_id']} {m['criterion']} реплика {m['turn']} ({m.get('speaker', '?')}): {m['reason']}")
+    code = 0
     if args.validate:
         expect = len(records) if args.ids else EXPECT.get(args.set)
-        sys.exit(validate_file(out, source_path, expect))
+        code = validate_file(out, source_path, expect)
+    failed = error_ids(results)
+    if args.expect_ok and failed:
+        print("\n" + "!" * 70)
+        print(f"!!! ВНИМАНИЕ: {len(failed)} записей со status=error — файл НЕ готов к сдаче: {', '.join(failed)}")
+        print("!" * 70)
+        code = code or 3
+    sys.exit(code)
+
+
+def error_ids(results: list[dict]) -> list[str]:
+    """Conversation ids of status=error records (for --expect-ok)."""
+    return [r.get("conversation_id", "?") for r in results if r.get("status") == "error"]
 
 
 if __name__ == "__main__":

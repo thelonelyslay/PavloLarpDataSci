@@ -279,5 +279,46 @@ class WeightOnlyChangeTest(unittest.TestCase):
         self.assertGreater(peak[0], 1)
 
 
+class ExportEndpointTest(unittest.TestCase):
+    """GET /api/export: only ready evaluations by default, log tail on failure, ok/error counts on success."""
+
+    def setUp(self):
+        from server import export
+        self.export = export
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        (root / "data" / "raw").mkdir(parents=True)
+        (root / "data" / "raw" / "dev.json").write_text("{}", encoding="utf-8")
+        self.root_patch = patch.object(export, "ROOT", root)
+        self.root_patch.start()
+        self.result_file = root / "results" / "dev" / "results.json"
+
+    def tearDown(self):
+        self.root_patch.stop()
+        self.tmp.cleanup()
+
+    def test_failure_returns_log_tail_and_default_is_only_cached(self):
+        log = "\n".join(f"строка {i}" for i in range(1, 16))
+        failed = __import__("subprocess").CompletedProcess([], 2, stdout=log, stderr="")
+        with patch.object(self.export.subprocess, "run", return_value=failed) as run:
+            with self.assertRaises(evaluations.HTTPException) as ctx:
+                self.export.export_results(set="dev")
+        self.assertIn("--only-cached", run.call_args[0][0])  # no paid evaluation by default
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertIn("строка 15", ctx.exception.detail)
+        self.assertIn("строка 6", ctx.exception.detail)
+        self.assertNotIn("строка 5\n", ctx.exception.detail)  # only the last 10 lines
+
+    def test_success_reports_counts(self):
+        self.result_file.parent.mkdir(parents=True)
+        self.result_file.write_text(json.dumps({"results": [{"status": "ok"}, {"status": "ok"}, {"status": "error"}]}),
+                                    encoding="utf-8")
+        done = __import__("subprocess").CompletedProcess([], 0, stdout="", stderr="")
+        with patch.object(self.export.subprocess, "run", return_value=done) as run:
+            response = self.export.export_results(set="dev", only_cached=False)
+        self.assertNotIn("--only-cached", run.call_args[0][0])
+        self.assertEqual((response.headers["x-export-ok"], response.headers["x-export-error"]), ("2", "1"))
+
+
 if __name__ == "__main__":
     unittest.main()

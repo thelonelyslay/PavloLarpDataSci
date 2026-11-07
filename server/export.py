@@ -1,6 +1,7 @@
 """Download validated organizer-format results through the server."""
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -16,9 +17,25 @@ router = APIRouter(prefix="/api")
 _export_lock = threading.Lock()
 
 
+def _log_tail(run: subprocess.CompletedProcess, lines: int = 10) -> str:
+    """Last lines of the export script output (it prints no keys or data URLs)."""
+    text = [l for l in (run.stdout + "\n" + run.stderr).splitlines() if l.strip() and "Warning" not in l]
+    return "\n".join(text[-lines:]) or "(скрипт ничего не вывел)"
+
+
+def _counts(path: Path) -> tuple[int, int]:
+    results = json.loads(path.read_text(encoding="utf-8")).get("results", [])
+    errors = sum(1 for r in results if r.get("status") == "error")
+    return len(results) - errors, errors
+
+
 @router.get("/export")
-def export_results(set: Literal["dev", "prod"] = "dev", only_cached: bool = False) -> FileResponse:
-    """Build, validate, then return results/<set>/results.json."""
+def export_results(set: Literal["dev", "prod"] = "dev", only_cached: bool = True) -> FileResponse:
+    """Build, validate, then return results/<set>/results.json.
+
+    Always by the standard repository checklists (export_results.py). By default only ready evaluations are
+    used (no paid model calls); only_cached=false evaluates missing dialogs first.
+    Headers X-Export-Ok / X-Export-Error give the number of ok and error records."""
     if not _export_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Выгрузка уже выполняется")
     try:
@@ -46,8 +63,11 @@ def export_results(set: Literal["dev", "prod"] = "dev", only_cached: bool = Fals
         except subprocess.TimeoutExpired:
             raise HTTPException(status_code=504, detail="Превышено время ожидания выгрузки") from None
         if run.returncode != 0 or not destination.is_file():
-            raise HTTPException(status_code=502,
-                                detail="Выгрузка или проверка формата не прошла; проверьте настройки модели и данные")
-        return FileResponse(destination, media_type="application/json", filename=f"{set}_results.json")
+            raise HTTPException(status_code=502, detail="Выгрузка или проверка формата не прошла. "
+                                                        "Последние строки лога:\n" + _log_tail(run))
+        ok, errors = _counts(destination)
+        return FileResponse(destination, media_type="application/json", filename=f"{set}_results.json",
+                            headers={"X-Export-Ok": str(ok), "X-Export-Error": str(errors),
+                                     "Access-Control-Expose-Headers": "X-Export-Ok, X-Export-Error, Content-Disposition"})
     finally:
         _export_lock.release()

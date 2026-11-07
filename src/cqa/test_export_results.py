@@ -241,6 +241,29 @@ class ServerCacheTest(unittest.TestCase):
             self.assertEqual(decided["closing"], "no")
 
 
+class ExpectOkTest(unittest.TestCase):
+    def run_main(self, results, *flags):
+        info = {"stopped": False, "results": results, "models": ["m"], "items": [], "missing": [],
+                "other": {}, "new_cost": 0.0, "by_model": __import__("collections").Counter({"m": 1})}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(ex, "load_source", return_value=([{"conversation_id": "c1"}], Path(tmp) / "d.json")), \
+                mock.patch.object(ex, "_server", return_value=(None, None)), \
+                mock.patch.object(ex, "collect", return_value=info), \
+                mock.patch.object(sys, "argv", ["x", "--set", "prod", "--out", str(Path(tmp) / "r.json"), *flags]), \
+                mock.patch("builtins.print"):
+            with self.assertRaises(SystemExit) as ctx:
+                ex.main()
+        return ctx.exception.code
+
+    def test_expect_ok(self):
+        ok = ex.ok_record("c1", CHAT, ANSWERS, DETAILS)
+        bad = ex.error_record("c2", "сбой")
+        self.assertEqual(ex.error_ids([ok, bad]), ["c2"])
+        self.assertEqual(self.run_main([ok, bad], "--expect-ok"), 3)
+        self.assertEqual(self.run_main([ok, bad]), 0)          # without the flag errors do not fail the run
+        self.assertEqual(self.run_main([ok], "--expect-ok"), 0)
+
+
 class PickRowTest(unittest.TestCase):
     def test_pick_row(self):
         rows = [{"model": "claude-opus-5-5", "id": 2}, {"model": "claude-sonnet-5-5", "id": 1}]  # newest first
