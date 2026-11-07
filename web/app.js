@@ -78,6 +78,8 @@
     const bad = kind === 'error' || (kind === undefined && /не удалось|ошибк|не сохранен|не отправлен|^укажите|^выберите|^проверьте|только с сервером|недоступ|нет диалогов|сначала|изменений нет|не принимает/i.test(msg));
     let box = document.getElementById('toast-box');
     if (!box) { box = document.createElement('div'); box.id = 'toast-box'; document.body.appendChild(box); }
+    // at most two at a time: drop the oldest
+    while (box.children.length >= 2) box.firstElementChild.remove();
     const t = document.createElement('div');
     t.className = 'toast ' + (bad ? 'toast-bad' : 'toast-ok');
     t.textContent = msg;
