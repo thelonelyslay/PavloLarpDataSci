@@ -103,16 +103,22 @@ def _init_db() -> None:
             reason TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )""")
-        for filename, seed_id in (("checklist.default.json", "default-chat-v1"),
-                                  ("checklist.calls.json", "default-call-v1")):
+        for filename, seed_prefix in (("checklist.default.json", "default-chat"),
+                                      ("checklist.calls.json", "default-call")):
             checklist = json.loads((ROOT / "src" / "cqa" / filename).read_text(encoding="utf-8"))
             validate_checklist(checklist)
             channel = checklist["applies_to"]
-            has_active = db.execute("SELECT 1 FROM checklists WHERE applies_to = ? AND active = 1", (channel,)).fetchone()
+            seed_id = f"{seed_prefix}-v{checklist['version']}"
+            active_row = db.execute("SELECT id FROM checklists WHERE applies_to = ? AND active = 1", (channel,)).fetchone()
+            if active_row and active_row["id"].startswith(seed_prefix + "-v") and active_row["id"] != seed_id:
+                db.execute("UPDATE checklists SET active = 0 WHERE id = ?", (active_row["id"],))
+                active_row = None
             db.execute("""INSERT OR IGNORE INTO checklists
                 (id, name, version, applies_to, checklist_json, active) VALUES (?, ?, ?, ?, ?, ?)""",
                 (seed_id, checklist["name"], checklist["version"], channel,
-                 json.dumps(checklist, ensure_ascii=False), 0 if has_active else 1))
+                 json.dumps(checklist, ensure_ascii=False), 0 if active_row else 1))
+            if active_row is None:
+                db.execute("UPDATE checklists SET active = 1 WHERE id = ?", (seed_id,))
 
 
 def _checklist_response(row: sqlite3.Row, include_json: bool = False) -> dict:

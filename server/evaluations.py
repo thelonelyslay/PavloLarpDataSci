@@ -5,42 +5,51 @@ import hashlib
 import importlib
 import json
 import os
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+from pathlib import Path
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import JSONResponse
 
 from src.cqa.scoring import score
-from .app import _connect, get_conversation
-
 router = APIRouter(prefix="/api")
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def _run_engine(record: dict, checklist: dict) -> tuple[dict, dict, str, float, int, int, float | None, str]:
-    """Use Ramazan's engine when merged; a clearly marked stub otherwise."""
+def _connect():
+    return importlib.import_module("server.app")._connect()
+
+
+def get_conversation(conversation_id: str) -> dict:
+    return importlib.import_module("server.app").get_conversation(conversation_id)
+
+
+class EngineEvaluationError(Exception):
+    pass
+
+
+class EngineChecklistError(Exception):
+    pass
+
+
+def _run_engine(record: dict, checklist: dict) -> tuple[dict, dict]:
+    """Invoke the merged evaluator with its expected record shape."""
+    engine_path = str(ROOT / "src" / "cqa")
+    if engine_path not in sys.path:
+        sys.path.insert(0, engine_path)
+    evaluator = importlib.import_module("evaluator")
+    stats: dict = {}
+    engine_record = {**record, "conversation_id": record["id"]}
     try:
-        llm = importlib.import_module("src.cqa.llm")
-        prompting = importlib.import_module("src.cqa.prompting")
-    except ModuleNotFoundError as exc:
-        if exc.name not in ("src.cqa.llm", "src.cqa.prompting"):
-            raise
-        answers = {c["id"]: (max(c["steps"]) if c["type"] == "scale" else "no" if c["type"] == "flag" else "yes")
-                   for c in checklist["criteria"]}
-        details = {c["id"]: {"explanation": "Тестовая заглушка: реальная модель не вызывалась.", "evidence": []}
-                   for c in checklist["criteria"]}
-        return answers, details, "STUB", 0.0, 0, 0, 0.0, "stub"
-    env = llm.load_env()
-    specs = llm.available_models(env)
-    selected = os.environ.get("CQA_MODEL", "").strip()
-    spec = next((item for item in specs if item.name == selected or item.model_id == selected), None) if selected else next(iter(specs), None)
-    if spec is None:
-        raise HTTPException(status_code=503, detail="No configured evaluation model")
-    result = llm.call(spec, env, prompting.build_system_prompt(checklist),
-                      prompting.build_user_prompt(record), prompting.build_schema(checklist))
-    answers, details, _warnings = prompting.parse_answer(result.text, checklist, record)
-    return (answers, details, spec.name, result.seconds, result.input_tokens,
-            result.output_tokens, result.cost_usd, "complete")
+        result = evaluator.evaluate(engine_record, checklist, stats=stats)
+    except evaluator.ChecklistError as exc:
+        raise EngineChecklistError(str(exc)) from None
+    except evaluator.EvaluationError as exc:
+        raise EngineEvaluationError(str(exc)) from None
+    return result, stats
 
 
 def _compose(evaluation_id: str, record: dict, checklist_id: str, checklist: dict,
@@ -95,29 +104,40 @@ def create_evaluation(request: dict) -> dict:
         raise HTTPException(status_code=422, detail="Checklist channel differs from conversation channel")
     source = json.dumps({"conversation_id": record["id"], "transcript": record["transcript"], "language": record["language"],
                          "channel": record["channel"], "checklist": checklist, "checklist_id": row["id"],
-                         "model": os.environ.get("CQA_MODEL", "")}, sort_keys=True, ensure_ascii=False)
+                         "models": os.environ.get("EVAL_MODELS", "")}, sort_keys=True, ensure_ascii=False)
     cache_key = hashlib.sha256(source.encode("utf-8")).hexdigest()
     with _connect() as db:
-        cached = db.execute("""SELECT result_json FROM evaluations e WHERE cache_key = ? AND model != 'STUB'
+        cached = db.execute("""SELECT result_json FROM evaluations e WHERE cache_key = ? AND model != 'ERROR'
             AND NOT EXISTS (SELECT 1 FROM appeals a WHERE a.evaluation_id = e.id)
             ORDER BY rowid DESC LIMIT 1""",
                             (cache_key,)).fetchone()
     if cached:
         return json.loads(cached["result_json"])
     try:
-        answers, details, model, duration, input_tokens, output_tokens, cost, status = _run_engine(record, checklist)
-        evaluation_id = uuid4().hex
-        result = _compose(evaluation_id, record, row["id"], checklist, model, cost, status,
-                          answers, answers, details)
-    except HTTPException:
-        raise
-    except (ValueError, RuntimeError, KeyError) as exc:
-        raise HTTPException(status_code=502, detail=f"Evaluation failed: {type(exc).__name__}") from None
+        result, stats = _run_engine(record, checklist)
+        answers = {c["id"]: c["original_answer"] for c in result["criteria"]}
+        result["checklist_id"] = row["id"]
+        result["checklist_version"] = row["version"]
+        model = result["model"]
+        duration = stats["seconds"]
+        input_tokens = stats["input_tokens"]
+        output_tokens = stats["output_tokens"]
+        cost = result["cost_usd"]
+    except (EngineEvaluationError, EngineChecklistError) as exc:
+        status_code = 422 if isinstance(exc, EngineChecklistError) else 502
+        result = {"id": uuid4().hex, "conversation_id": conversation_id, "checklist_id": row["id"],
+                  "checklist_version": row["version"], "status": "error", "error": str(exc),
+                  "model": None, "total": None, "original_total": None, "criteria": []}
+        with _connect() as db:
+            db.execute("""INSERT INTO evaluations (id, conversation_id, checklist_id, checklist_version,
+                model, answers_json, result_json, total) VALUES (?, ?, ?, ?, 'ERROR', '{}', ?, NULL)""",
+                (result["id"], conversation_id, row["id"], row["version"], json.dumps(result, ensure_ascii=False)))
+        return JSONResponse(status_code=status_code, content=result)
     with _connect() as db:
         db.execute("""INSERT INTO evaluations (id, conversation_id, checklist_id, checklist_version,
             model, answers_json, result_json, total, duration_seconds, input_tokens, output_tokens,
             cost_usd, cache_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (evaluation_id, conversation_id, row["id"], row["version"], model,
+            (result["id"], conversation_id, row["id"], row["version"], model,
              json.dumps(answers, ensure_ascii=False), json.dumps(result, ensure_ascii=False), result["total"],
              duration, input_tokens, output_tokens, cost, cache_key))
     return result
@@ -142,7 +162,11 @@ def create_batch(request: dict) -> dict:
             pool = ThreadPoolExecutor(max_workers=1)
             task = pool.submit(create_evaluation, body)
             try:
-                results.append({"conversation_id": cid, "evaluation": task.result(timeout=timeout)})
+                evaluation = task.result(timeout=timeout)
+                if isinstance(evaluation, JSONResponse):
+                    raise HTTPException(status_code=evaluation.status_code,
+                                        detail=json.loads(evaluation.body).get("error", "Evaluation failed"))
+                results.append({"conversation_id": cid, "evaluation": evaluation})
                 last_error = None
                 break
             except FutureTimeout:
@@ -167,6 +191,8 @@ def create_batch(request: dict) -> dict:
 @router.post("/evaluations/{evaluation_id}/appeals", status_code=201)
 def create_appeal(evaluation_id: str, request: dict) -> dict:
     _, result = _load_evaluation(evaluation_id)
+    if result["status"] == "error":
+        raise HTTPException(status_code=409, detail="Failed evaluation cannot be appealed")
     criterion_id, comment = request.get("criterion_id"), request.get("comment")
     if not isinstance(comment, str) or not comment.strip() or criterion_id not in {c["id"] for c in result["criteria"]}:
         raise HTTPException(status_code=422, detail="Valid criterion_id and comment are required")
