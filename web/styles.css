@@ -1530,3 +1530,4 @@ tr.row-removed td { background: #fef2f2; color: #991b1b; font-size: 12.5px; }
 #criterion-modal textarea { font-family: inherit; font-size: 13.5px; }
 .cs-name { overflow-wrap: anywhere; hyphens: auto; }
 .cs-pts { flex: none; margin-left: 6px; }
+.weight-indicator-info { background: #f1f5f3; color: #334155; border: 1px solid #e2e8f0; }

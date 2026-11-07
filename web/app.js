@@ -1160,13 +1160,9 @@
     // Calculate sum of weights for non-flag criteria
     const sumWeights = checklist.criteria.filter(c => c.type !== 'flag').reduce((sum, c) => sum + (Number(c.weight) || 0), 0);
     if (indicatorEl) {
-      if (sumWeights === 100) {
-        indicatorEl.className = 'weight-indicator-badge weight-indicator-ok';
-        indicatorEl.innerHTML = '✓ Сумма весов: <strong>100 / 100</strong> (Сбалансировано)';
-      } else {
-        indicatorEl.className = 'weight-indicator-badge weight-indicator-warn';
-        indicatorEl.innerHTML = `Сумма весов: <strong>${sumWeights}</strong> — итог всё равно приводится к 100 (вес × 100 / сумма применимых)`;
-      }
+      // Not a warning: any sum is fine, scoring.py normalises the total to 100
+      indicatorEl.className = 'weight-indicator-badge weight-indicator-info';
+      indicatorEl.innerHTML = `ℹ️ Сумма весов: <strong>${sumWeights}</strong>. Итог автоматически приводится к 100.`;
     }
 
     tbody.innerHTML = '';
@@ -1736,6 +1732,8 @@
     const recs = checkUploadText();
     if (!recs) { toast('Проверьте JSON'); return; }
     if (!isLive()) { toast('Загрузка нового диалога работает только с сервером.'); return; }
+    const dup = recs.filter(r => state.conversations.some(c => c.conversation_id === String(r.conversation_id))).map(r => r.conversation_id);
+    if (dup.length && !confirm(`Диалог ${dup.join(', ')} уже есть. Заменить его новым текстом? Старые оценки останутся в истории.`)) return;
     const btn = document.getElementById('btn-upload-submit');
     if (btn) { btn.disabled = true; btn.textContent = '⏳ Загружаем…'; }
     try {
@@ -1830,10 +1828,12 @@
   }
   async function exportFromServer() {
     const btn = document.getElementById('btn-export-server');
-    if (btn) { btn.disabled = true; btn.textContent = '⏳ Готовим файл…'; }
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Сервер собирает файл… (может занять несколько минут)'; }
+    toast('Выгрузка запущена: сервер оценивает недостающие диалоги и проверяет формат. Можно работать дальше.', 'ok');
     try {
-      const data = await api().exportResults();
-      download(`cqa_export_${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(data, null, 2), 'application/json');
+      const file = await api().exportResults();
+      download(file.filename || `dev_results_${new Date().toISOString().slice(0, 10)}.json`, file.text, 'application/json');
+      toast('Файл результатов скачан', 'ok');
     } catch (e) {
       toast('Экспорт не удался: ' + e.message);
     } finally {

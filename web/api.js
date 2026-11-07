@@ -255,7 +255,24 @@ window.CQA_API = (function () {
     /** GET /api/export: all results as JSON from the server */
     async exportResults() {
       if (mode !== 'live') demoOnly('Экспорт результатов с сервера');
-      return req('GET', EXPORT_PATH, null, 60000);
+      // The server may evaluate missing dialogues first (up to an hour). Keep its file byte-for-byte.
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 65 * 60 * 1000);
+      try {
+        const res = await fetch(base + EXPORT_PATH, { signal: ctrl.signal });
+        const text = await res.text();
+        if (!res.ok) {
+          let msg = res.statusText;
+          try { const j = JSON.parse(text); msg = j.detail || j.error || msg; } catch (e) { /* not JSON */ }
+          throw new Error(res.status === 409 ? 'выгрузка уже идёт, дождитесь файла' : `${res.status}: ${msg}`);
+        }
+        const cd = res.headers.get('Content-Disposition') || '';
+        const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+        return { text, filename: m ? decodeURIComponent(m[1]) : null };
+      } catch (e) {
+        if (e.name === 'AbortError') throw new Error('сервер не ответил за 65 минут');
+        throw e;
+      } finally { clearTimeout(timer); }
     },
 
     async getAppeals(status) {
