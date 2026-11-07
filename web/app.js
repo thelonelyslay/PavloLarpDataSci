@@ -1107,7 +1107,12 @@
     state.appeals.forEach(item => {
       const tr = document.createElement('tr');
       const isPending = item.appeal.status === 'open';
-      const ev = state.evalById[item.evaluation_id] || {};
+      // A decision carried into a newer evaluation (weight-only recalculation): show that evaluation's totals
+      const own = state.evalById[item.evaluation_id] || {};
+      const latest = state.evaluations[item.conversation_id];
+      const carried = latest && latest.id !== own.id && item.appeal.status === 'decided'
+        && (((latest.criteria || []).find(c => c.id === item.criterion_id) || {}).appeal || {}).status === 'decided';
+      const ev = carried ? latest : own;
       const crit = (ev.criteria || []).find(c => c.id === item.criterion_id) || {};
       const def = critDef(ev, item.criterion_id);
       const orig = crit.original_answer !== undefined && crit.original_answer !== null ? crit.original_answer : crit.answer;

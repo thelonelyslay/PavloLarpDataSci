@@ -190,9 +190,15 @@ def create_evaluation(request: dict) -> dict:
         old_result = json.loads(reused["result_json"])
         details = {c["id"]: {"explanation": c.get("explanation", ""), "evidence": c.get("evidence", [])}
                    for c in old_result.get("criteria", [])}
+        # Reviewers' decided appeals are applied on top of the reused answers (open ones stay on the old evaluation).
+        final, appeals = dict(original), {}
+        for c in old_result.get("criteria", []):
+            if (c.get("appeal") or {}).get("status") == "decided":
+                final[c["id"]] = c.get("final_answer", original.get(c["id"]))
+                appeals[c["id"]] = c["appeal"]
         try:
             result = _compose(uuid4().hex, record, row["id"], checklist, reused["model"], 0.0, "done",
-                              original, original, details)
+                              original, final, details, appeals)
         except (ValueError, KeyError):
             result = None  # answers do not fit the new checklist after all: evaluate normally below
         if result is not None:

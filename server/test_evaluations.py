@@ -218,6 +218,35 @@ class WeightOnlyChangeTest(unittest.TestCase):
             evaluations.create_evaluation({"conversation_id": "w-1", "force": "yes"})
             self.assertEqual(model.call_count, 3)  # only a real true forces
 
+    def test_decided_appeals_carry_over_on_weight_only_change(self):
+        with patch.object(evaluations, "_run_engine", side_effect=self.fake_engine) as model:
+            base = evaluations.create_evaluation({"conversation_id": "w-1"})
+            decided = evaluations.create_appeal(base["id"], {"criterion_id": "empathy", "comment": "грубо"})
+            evaluations.decide_appeal(decided["id"], {"decision": "change", "new_answer": "no", "reason": "проверено"})
+            evaluations.create_appeal(base["id"], {"criterion_id": "closing", "comment": "открыта"})  # stays open
+
+            def weights(ck):
+                for c in ck["criteria"]:
+                    if c["id"] == "empathy":
+                        c["weight"] = 30
+            weights_id = self._new_version(weights)
+            new = evaluations.create_evaluation({"conversation_id": "w-1", "checklist_id": weights_id})
+            self.assertEqual(model.call_count, 1)  # still no model call
+            by = {c["id"]: c for c in new["criteria"]}
+            self.assertEqual((by["empathy"]["original_answer"], by["empathy"]["final_answer"]), ("yes", "no"))
+            self.assertEqual(by["empathy"]["appeal"]["decision"], "change")
+            self.assertIsNone(by["closing"]["appeal"])  # open appeal is not carried
+            with app._connect() as db:
+                ck = json.loads(db.execute("SELECT checklist_json FROM checklists WHERE id = ?",
+                                           (weights_id,)).fetchone()["checklist_json"])
+            final = {c["id"]: c["final_answer"] for c in new["criteria"]}
+            original = {c["id"]: c["original_answer"] for c in new["criteria"]}
+            self.assertEqual(new["total"], score(ck, final)["total"])
+            self.assertEqual(new["original_total"], score(ck, original)["total"])
+            self.assertLess(new["total"], new["original_total"])
+            listed = next(c for c in app.list_conversations() if c["id"] == "w-1")
+            self.assertEqual(listed["total"], new["total"])  # the list shows the same total as the evaluation
+
     def test_changed_transcript_is_evaluated_again(self):
         with patch.object(evaluations, "_run_engine", side_effect=self.fake_engine) as model:
             evaluations.create_evaluation({"conversation_id": "w-2"})
