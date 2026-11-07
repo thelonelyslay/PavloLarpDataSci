@@ -7,9 +7,10 @@
  *  - "demo": the server is unavailable. Read-only DEMO data from demo/demo_data.js
  *    (synthetic dialogues). The UI marks this mode clearly; evaluation is disabled.
  *
- * Server address: saved in the UI (Источник данных), or ?api=http://host:8000/api,
- * or same origin /api when the page is served by the server, else http://localhost:8000/api.
+ * Server address: API_BASE ('/api', relative: the server serves web/ at http://127.0.0.1:8000/).
+ * Overrides for development: ?api=http://127.0.0.1:8000/api or the address in the "Источник данных" dialog.
  */
+const API_BASE = '/api';
 window.CQA_API = (function () {
   'use strict';
 
@@ -21,14 +22,21 @@ window.CQA_API = (function () {
     const q = new URLSearchParams(location.search).get('api');
     if (q) return q;
     try { const saved = localStorage.getItem(LS_KEY); if (saved) return saved; } catch (e) { /* storage off */ }
-    if (location.protocol.startsWith('http')) return location.origin + '/api';
-    return 'http://localhost:8000/api';
+    return API_BASE;
   }
 
   let base = defaultBase().replace(/\/$/, '');
   let mode = 'demo';
   const demo = window.CQA_DEMO_DATA || { demo: true, checklists: {}, conversations: [], evaluations: {} };
   const clone = o => JSON.parse(JSON.stringify(o));
+  const EV_KEY = 'cqa_last_evaluations';
+  function rememberEval(ev) {
+    if (!ev || !ev.id || !ev.conversation_id) return;
+    try { const m = JSON.parse(localStorage.getItem(EV_KEY) || '{}'); m[base + '|' + ev.conversation_id] = ev.id; localStorage.setItem(EV_KEY, JSON.stringify(m)); } catch (e) { /* storage off */ }
+  }
+  function rememberedEvalId(cid) {
+    try { return (JSON.parse(localStorage.getItem(EV_KEY) || '{}'))[base + '|' + cid] || null; } catch (e) { return null; }
+  }
 
   async function req(method, path, body, timeout) {
     const ctrl = new AbortController();
@@ -45,8 +53,9 @@ window.CQA_API = (function () {
       try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
       if (!res.ok) {
         const msg = (data && (data.detail || data.error || data.message)) || res.statusText;
-        const err = new Error(`${method} ${path}: ${res.status} ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`);
+        const err = new Error(`${res.status}: ${typeof msg === 'string' ? msg : JSON.stringify(msg)}`);
         err.status = res.status;
+        err.data = data; // e.g. a saved evaluation with status "error"
         throw err;
       }
       return data;
@@ -87,6 +96,10 @@ window.CQA_API = (function () {
 
     /** Decide the mode: live if GET /health answers, otherwise demo. */
     async connect() {
+      if (!/^https?:/.test(base) && !location.protocol.startsWith('http')) {
+        mode = 'demo';
+        return { status: 'demo', message: 'ДЕМО-ДАННЫЕ (страница открыта как файл)' };
+      }
       try {
         await req('GET', '/health', null, 3000);
         mode = 'live';
@@ -125,12 +138,10 @@ window.CQA_API = (function () {
     /** Latest evaluation of a conversation, or null if it was not evaluated yet. */
     async getLatestEvaluation(conv) {
       if (mode === 'live') {
-        if (conv.last_evaluation_id) return req('GET', '/evaluations/' + encodeURIComponent(conv.last_evaluation_id));
-        try {
-          const r = await req('GET', '/evaluations?conversation_id=' + encodeURIComponent(conv.conversation_id));
-          const list = Array.isArray(r) ? r : (r ? [r] : []);
-          return list.length ? list[list.length - 1] : null;
-        } catch (e) { if (e.status === 404) return null; throw e; }
+        const id = conv.last_evaluation_id || rememberedEvalId(conv.conversation_id);
+        if (!id) return null;
+        try { return await req('GET', '/evaluations/' + encodeURIComponent(id)); }
+        catch (e) { if (e.status === 404) return null; throw e; }
       }
       const ev = demo.evaluations[conv.conversation_id];
       return ev ? clone(ev) : null;
@@ -145,7 +156,16 @@ window.CQA_API = (function () {
     /** POST /api/evaluations {conversation_id, checklist_id} */
     async evaluate(conversationId, checklistId) {
       if (mode !== 'live') demoOnly('Оценка диалога');
-      return req('POST', '/evaluations', { conversation_id: conversationId, checklist_id: checklistId }, EVAL_TIMEOUT_MS);
+      const body = { conversation_id: conversationId };
+      if (checklistId) body.checklist_id = checklistId; // otherwise the server uses the channel's active checklist
+      try {
+        const ev = await req('POST', '/evaluations', body, EVAL_TIMEOUT_MS);
+        rememberEval(ev);
+        return ev;
+      } catch (e) {
+        if (e.data && e.data.status === 'error') { rememberEval(e.data); return e.data; }
+        throw e;
+      }
     },
 
     /** POST /api/evaluations/batch {conversation_ids, checklist_id} */
@@ -161,7 +181,7 @@ window.CQA_API = (function () {
         const out = {};
         for (const item of list) {
           const full = item.criteria ? item : await req('GET', '/checklists/' + encodeURIComponent(item.id));
-          out[full.id] = full;
+          out[full.id] = Object.assign({}, full, { id: item.id, active: Boolean(item.active) });
         }
         return out;
       }
@@ -183,6 +203,16 @@ window.CQA_API = (function () {
     async createAppeal(evaluationId, criterionId, comment) {
       if (mode !== 'live') demoOnly('Подача апелляции');
       return req('POST', '/evaluations/' + encodeURIComponent(evaluationId) + '/appeals', { criterion_id: criterionId, comment });
+    },
+
+    /** Add new conversations: POST /api/conversations {records:[...]} (needs the server route). */
+    async addConversations(records) {
+      if (mode !== 'live') demoOnly('Загрузка нового диалога');
+      try { return await req('POST', '/conversations', { records }); }
+      catch (e) {
+        if (e.status === 404 || e.status === 405) throw new Error('сервер пока не принимает новые диалоги: нужен маршрут POST /api/conversations');
+        throw e;
+      }
     },
 
     async getAppeals(status) {

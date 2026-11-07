@@ -84,6 +84,11 @@
             </div>
           </div>
 
+          <div class="list-tools">
+            <div id="batch-bar"></div>
+            <button class="chip-btn upload-btn" id="btn-open-upload" title="Вставить или загрузить диалог в формате API (JSON)">＋ Диалог (JSON)</button>
+          </div>
+
           <div class="conversations-list" id="conversations-list">
             <!-- Dynamically populated via app.js -->
           </div>
@@ -214,12 +219,14 @@
         <div class="view-header">
           <div>
             <h2>Конструктор чек-листа оценки качества</h2>
-            <p>Критерии, веса, формулировки, шкалы и правила. Изменения попадают в черновик; «Сохранить и применить» сохраняет новую версию на сервере (POST /api/checklists) и переоценивает диалоги.</p>
+            <p>Критерии, вес, тип ответа, правила и уточнения. Правки идут в черновик → «Сохранить версию» (новая версия на сервере, становится активной) → «Применить к диалогам и пересчитать».</p>
+            <p id="checklist-draft-note" class="draft-note"></p>
           </div>
           <div class="checklist-builder-actions">
             <button class="btn-secondary" id="btn-reset-checklist">Отменить черновик</button>
             <button class="btn-primary" id="btn-add-criterion">+ Добавить критерий</button>
-            <button class="btn-primary" id="btn-apply-checklist-changes" style="background: var(--primary-dark);">Сохранить и применить к диалогам</button>
+            <button class="btn-primary" id="btn-save-checklist">Сохранить версию</button>
+            <button class="btn-primary" id="btn-apply-checklist-changes" style="background: var(--primary-dark);">Применить к диалогам и пересчитать</button>
           </div>
         </div>
 
@@ -370,41 +377,44 @@
 
   <!-- MODAL: SUPERVISOR REVIEW DECISION -->
   <div class="modal-overlay" id="review-modal">
-    <div class="modal-box">
+    <div class="modal-box modal-wide">
       <div class="modal-header">
-        <h3>Решение проверяющего (QC Review)</h3>
+        <h3>Рассмотрение апелляции</h3>
         <button class="close-btn" onclick="app.closeModal('review-modal')">✕</button>
       </div>
       <div class="modal-body">
-        <div class="form-group">
-          <label>Диалог и критерий:</label>
-          <input type="text" id="review-modal-target" class="form-control" readonly>
-          <input type="hidden" id="review-modal-conv-id">
-          <input type="hidden" id="review-modal-criterion-id">
-        </div>
-        <div class="form-group">
-          <label>Комментарий оператора:</label>
-          <div id="review-modal-operator-comment" style="font-size: 12px; background: #fffbeb; padding: 8px 10px; border-radius: 6px; border: 1px solid #fde68a;"></div>
-        </div>
-        <div class="form-group">
-          <label>Решение проверяющего:</label>
-          <select id="review-modal-decision-type" class="form-control">
-            <option value="confirm">Подтвердить оценку</option>
-            <option value="change">Изменить оценку (итог пересчитает сервер)</option>
-          </select>
+        <input type="hidden" id="review-modal-conv-id">
+        <input type="hidden" id="review-modal-eval-id">
+        <input type="hidden" id="review-modal-criterion-id">
+        <div class="review-grid">
+          <div>
+            <div class="review-k">Диалог и критерий</div>
+            <div class="review-v" id="review-modal-target"></div>
+            <div class="review-k">Оценка системы</div>
+            <div class="review-v" id="review-modal-current"></div>
+            <div class="review-k">Обоснование системы</div>
+            <div class="review-v" id="review-modal-explanation"></div>
+            <div class="review-k">Комментарий апелляции</div>
+            <div class="review-v review-comment" id="review-modal-operator-comment"></div>
+          </div>
+          <div>
+            <div class="review-k">Фрагмент диалога</div>
+            <div class="review-frag" id="review-modal-fragment"></div>
+          </div>
         </div>
         <div class="form-group" id="review-new-answer-group">
-          <label>Новая оценка:</label>
+          <label>Новая оценка (если апелляцию принимаете):</label>
           <select id="review-modal-new-answer" class="form-control"></select>
         </div>
         <div class="form-group">
-          <label>Обоснование решения проверяющего:</label>
-          <textarea id="review-modal-reason" class="form-control" placeholder="Укажите причину подтверждения или изменения оценки..."></textarea>
+          <label>Причина решения (обязательно):</label>
+          <textarea id="review-modal-reason" class="form-control" placeholder="Почему апелляция принята или отклонена"></textarea>
         </div>
       </div>
       <div class="modal-footer">
         <button class="btn-secondary" onclick="app.closeModal('review-modal')">Отмена</button>
-        <button class="btn-primary" id="btn-apply-review-decision">Сохранить решение</button>
+        <button class="btn-outline" id="btn-review-reject">Отклонить (оставить оценку)</button>
+        <button class="btn-primary" id="btn-review-accept">Принять и изменить оценку</button>
       </div>
     </div>
   </div>
@@ -489,6 +499,33 @@
       <div class="modal-footer">
         <button class="btn-secondary" onclick="app.closeModal('api-modal')">Отмена</button>
         <button class="btn-primary" id="btn-save-api-config">Подключиться</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: ADD CONVERSATION FROM JSON -->
+  <div class="modal-overlay" id="upload-modal">
+    <div class="modal-box modal-wide">
+      <div class="modal-header">
+        <h3>Новый диалог из JSON</h3>
+        <button class="close-btn" onclick="app.closeModal('upload-modal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 12px; color: var(--text-muted); margin: 0 0 8px;">Формат как у API организаторов: ответ целиком (<code>{"isSuccess": true, "data": {"records": [...]}}</code>), массив записей или одна запись <code>{conversation_id, channel, language, transcript: [{timestamp, speaker, text}], audio_url}</code>.</p>
+        <div class="form-group">
+          <label>Файл .json:</label>
+          <input type="file" id="upload-file" accept=".json,application/json" class="form-control">
+        </div>
+        <div class="form-group">
+          <label>…или вставьте JSON:</label>
+          <textarea id="upload-text" class="form-control mono-area" style="min-height: 160px;" placeholder='{"conversation_id": "new-ru-001", "channel": "agent chat", "language": "RU", "transcript": [{"timestamp": "00:00", "speaker": "client", "text": "..."}]}'></textarea>
+        </div>
+        <div id="upload-check" class="upload-check"></div>
+        <label style="font-size: 13px; display: flex; gap: 6px; align-items: center;"><input type="checkbox" id="upload-evaluate" checked> Сразу оценить загруженные диалоги</label>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" onclick="app.closeModal('upload-modal')">Отмена</button>
+        <button class="btn-primary" id="btn-upload-submit">Загрузить на сервер</button>
       </div>
     </div>
   </div>
