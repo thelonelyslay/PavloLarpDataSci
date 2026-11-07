@@ -120,11 +120,16 @@ def _prompt_fingerprint(checklist: dict) -> str:
 def _reusable_evaluation(record: dict, checklist: dict, checklist_id: str):
     """A successful evaluation of this dialog by ANOTHER checklist version that differs only in weights.
 
-    Conditions: same prompt fingerprint, and its stored cache key still matches when recomputed with its own
-    checklist, i.e. the transcript did not change since then, and it was made with the current model chain
-    (EVAL_MODELS) or with a one-model chain of the model that answered (export_results.py --require-model).
+    Conditions: same prompt fingerprint; made by the PRIMARY model (first in the current EVAL_MODELS), so a
+    fallback model's answers are never carried over; and its stored cache key still matches when recomputed
+    with its own checklist, i.e. the transcript did not change since then, and it was made with the current
+    model chain or with a one-model chain of that model (export_results.py --require-model).
     The same checklist version is never reused here (after an appeal it is deliberately evaluated again).
     """
+    chain = [m.strip() for m in os.environ.get("EVAL_MODELS", "").split(",") if m.strip()]
+    if not chain:
+        return None  # no primary model configured: do not guess, evaluate normally
+    primary = chain[0]
     fingerprint = _prompt_fingerprint(checklist)
     with _connect() as db:
         rows = db.execute("""SELECT e.*, c.checklist_json AS old_checklist_json FROM evaluations e
@@ -133,6 +138,8 @@ def _reusable_evaluation(record: dict, checklist: dict, checklist_id: str):
               AND e.cache_key IS NOT NULL AND c.applies_to = ?
             ORDER BY e.rowid DESC""", (record["id"], checklist_id, record["channel"])).fetchall()
     for row in rows:
+        if row["model"] != primary:
+            continue  # made by a fallback or another chain's model: treat as a miss
         old_checklist = json.loads(row["old_checklist_json"])
         if _prompt_fingerprint(old_checklist) != fingerprint:
             continue
@@ -287,24 +294,36 @@ BATCH_WORKERS = 4  # parallel dialogs in a background job, like src/cqa/export_r
 
 
 def _run_batch_job(job_id: str, ids: list[str], checklist_id: Optional[str]) -> None:
+    """Evaluate in parallel. One broken dialog becomes an error result; the job always ends as "done"
+    (the web UI polls until status == "done"); `failed` counts dialogs that ended with an error."""
     def one(cid: str) -> None:
-        result = create_batch({"conversation_ids": [cid], "checklist_id": checklist_id})["results"][0]
+        try:
+            result = create_batch({"conversation_ids": [cid], "checklist_id": checklist_id})["results"][0]
+        except Exception as exc:  # noqa: BLE001 - must not leave the job running
+            result = {"conversation_id": cid, "status": "error",
+                      "error": f"Внутренняя ошибка при оценке диалога ({type(exc).__name__})"}
         with _jobs_lock:
             job = _jobs[job_id]
             job["results"].append(result)  # completion order; the UI reads new items by count
             job["completed"] += 1
+            if result.get("status") == "error" or (result.get("evaluation") or {}).get("status") == "error":
+                job["failed"] = job.get("failed", 0) + 1
 
-    with ThreadPoolExecutor(max_workers=BATCH_WORKERS) as pool:
-        list(pool.map(one, ids))  # each create_evaluation uses its own SQLite connection
-    with _jobs_lock:
-        _jobs[job_id]["status"] = "done"
+    try:
+        with ThreadPoolExecutor(max_workers=BATCH_WORKERS) as pool:
+            list(pool.map(one, ids))  # each create_evaluation uses its own SQLite connection
+    finally:
+        with _jobs_lock:
+            job = _jobs[job_id]
+            job.setdefault("failed", 0)
+            job["status"] = "done"
 
 
 def start_batch_job(ids: list[str], checklist_id: Optional[str]) -> dict:
     if not ids:
         raise HTTPException(status_code=422, detail="Нет диалогов для пакетной оценки")
     job_id = uuid4().hex
-    job = {"id": job_id, "status": "running", "completed": 0, "total": len(ids), "results": []}
+    job = {"id": job_id, "status": "running", "completed": 0, "failed": 0, "total": len(ids), "results": []}
     with _jobs_lock:
         _jobs[job_id] = job
     threading.Thread(target=_run_batch_job, args=(job_id, ids, checklist_id), daemon=True).start()

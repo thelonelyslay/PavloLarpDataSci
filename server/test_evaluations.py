@@ -1,5 +1,6 @@
 """Persistence and cache checks for the evaluation workflow."""
 import json
+import os
 import tempfile
 import threading
 import time
@@ -72,11 +73,15 @@ class WeightOnlyChangeTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.db_patch = patch.object(app, "DB_PATH", Path(self.tmp.name) / "test.sqlite3")
         self.db_patch.start()
+        # the fake engine answers as "test-model", the primary (first) model of this chain
+        self.env_patch = patch.dict(os.environ, {"EVAL_MODELS": "test-model,backup-model"})
+        self.env_patch.start()
         app._init_db()
         for cid in ("w-1", "w-2", "w-3"):
             self._conversation(cid, "Здравствуйте, это тест")
 
     def tearDown(self):
+        self.env_patch.stop()
         self.db_patch.stop()
         self.tmp.cleanup()
 
@@ -135,9 +140,44 @@ class WeightOnlyChangeTest(unittest.TestCase):
             evaluations.create_evaluation({"conversation_id": "w-1", "checklist_id": rule_id})
             self.assertEqual(model.call_count, 2)  # changed rule -> normal evaluation
 
+    def test_fallback_model_answers_are_not_reused(self):
+        def fallback_engine(record, checklist):
+            result, stats = self.fake_engine(record, checklist)
+            result["model"] = "backup-model"  # the primary model failed, the fallback answered
+            return result, stats
+
+        with patch.object(evaluations, "_run_engine", side_effect=fallback_engine) as model:
+            evaluations.create_evaluation({"conversation_id": "w-3"})
+
+            def weights(ck):
+                ck["criteria"][0]["weight"] = 25
+            evaluations.create_evaluation({"conversation_id": "w-3", "checklist_id": self._new_version(weights)})
+            self.assertEqual(model.call_count, 2)  # not reused: evaluated again
+
+    def test_batch_job_survives_an_exception(self):
+        real_create_batch = evaluations.create_batch
+
+        def flaky_create_batch(request):
+            if request["conversation_ids"] == ["w-2"]:
+                raise RuntimeError("boom")
+            return real_create_batch(request)
+
+        job_id = "job-broken"
+        evaluations._jobs[job_id] = {"id": job_id, "status": "running", "completed": 0, "failed": 0,
+                                     "total": 3, "results": []}
+        with patch.object(evaluations, "_run_engine", side_effect=self.fake_engine), \
+                patch.object(evaluations, "create_batch", side_effect=flaky_create_batch):
+            evaluations._run_batch_job(job_id, ["w-1", "w-2", "w-3"], None)
+        job = evaluations.batch_progress(job_id)
+        self.assertEqual((job["status"], job["completed"], job["failed"]), ("done", 3, 1))
+        broken = next(r for r in job["results"] if r["conversation_id"] == "w-2")
+        self.assertEqual(broken["status"], "error")
+        self.assertIn("RuntimeError", broken["error"])
+        ok = [r for r in job["results"] if r["conversation_id"] != "w-2"]
+        self.assertTrue(all(r["evaluation"]["status"] == "done" for r in ok))
+
     def test_reuses_one_model_chain_from_export(self):
         # export_results.py --require-model stores keys with EVAL_MODELS = that one model
-        import os
         with patch.object(evaluations, "_run_engine", side_effect=self.fake_engine) as model:
             with patch.dict(os.environ, {"EVAL_MODELS": "test-model"}):
                 evaluations.create_evaluation({"conversation_id": "w-3"})
