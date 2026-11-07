@@ -10,6 +10,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
+from typing import Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException
@@ -56,8 +57,8 @@ def _run_engine(record: dict, checklist: dict) -> tuple[dict, dict]:
 
 
 def _compose(evaluation_id: str, record: dict, checklist_id: str, checklist: dict,
-             model: str, cost: float | None, status: str, original: dict,
-             final: dict, details: dict, appeals: dict | None = None) -> dict:
+             model: str, cost: Optional[float], status: str, original: dict,
+             final: dict, details: dict, appeals: Optional[dict] = None) -> dict:
     original_scored = score(checklist, original)
     scored = score(checklist, final)
     scored_by_id = {c["id"]: c for c in scored["criteria"]}
@@ -160,7 +161,7 @@ def get_evaluation(evaluation_id: str) -> dict:
 
 
 @router.get("/evaluations")
-def list_evaluations(conversation_id: str | None = None) -> list[dict]:
+def list_evaluations(conversation_id: Optional[str] = None) -> list[dict]:
     with _connect() as db:
         if conversation_id:
             rows = db.execute("SELECT result_json FROM evaluations WHERE conversation_id = ? ORDER BY created_at, rowid",
@@ -210,7 +211,7 @@ def create_batch(request: dict) -> dict:
     return {"status": "done", "completed": len(results), "total": len(ids), "results": results}
 
 
-def _run_batch_job(job_id: str, ids: list[str], checklist_id: str | None) -> None:
+def _run_batch_job(job_id: str, ids: list[str], checklist_id: Optional[str]) -> None:
     for cid in ids:
         result = create_batch({"conversation_ids": [cid], "checklist_id": checklist_id})["results"][0]
         with _jobs_lock:
@@ -221,7 +222,7 @@ def _run_batch_job(job_id: str, ids: list[str], checklist_id: str | None) -> Non
         _jobs[job_id]["status"] = "done"
 
 
-def start_batch_job(ids: list[str], checklist_id: str | None) -> dict:
+def start_batch_job(ids: list[str], checklist_id: Optional[str]) -> dict:
     if not ids:
         raise HTTPException(status_code=422, detail="Нет диалогов для пакетной оценки")
     job_id = uuid4().hex

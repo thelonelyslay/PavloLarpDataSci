@@ -10,6 +10,7 @@ from uuid import uuid4
 from html import escape
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
+from typing import Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -285,7 +286,7 @@ def recalculate_checklist(checklist_id: str) -> dict:
 
 
 @app.get("/api/conversations")
-def list_conversations(gross_error: bool | None = None) -> list[dict]:
+def list_conversations(gross_error: Optional[bool] = None) -> list[dict]:
     with _connect() as db:
         rows = db.execute("""SELECT c.id, c.channel, c.language,
             (SELECT e.total FROM evaluations e WHERE e.conversation_id = c.id
@@ -378,6 +379,8 @@ def sync_conversations() -> dict:
 
 
 from .evaluations import router as evaluations_router  # noqa: E402
+from .export import router as export_router  # noqa: E402
 
 app.include_router(evaluations_router)
+app.include_router(export_router)
 app.mount("/", StaticFiles(directory=ROOT / "web", html=True), name="web")
