@@ -17,7 +17,7 @@ _export_lock = threading.Lock()
 
 
 @router.get("/export")
-def export_results(set: Literal["dev", "prod"], only_cached: bool = False) -> FileResponse:
+def export_results(set: Literal["dev", "prod"] = "dev", only_cached: bool = False) -> FileResponse:
     """Build, validate, then return results/<set>/results.json."""
     if not _export_lock.acquire(blocking=False):
         raise HTTPException(status_code=409, detail="Выгрузка уже выполняется")
