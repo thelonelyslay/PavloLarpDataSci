@@ -11,6 +11,8 @@
  * Overrides for development: ?api=http://127.0.0.1:8000/api or the address in the "Источник данных" dialog.
  */
 const API_BASE = '/api';
+// Server export of all results (Alikhan's endpoint). The button turns on when the server lists this route in /openapi.json.
+const EXPORT_PATH = '/export';
 window.CQA_API = (function () {
   'use strict';
 
@@ -236,6 +238,24 @@ window.CQA_API = (function () {
         }
       }
       return saved;
+    },
+
+    /** Does the server have this route? Reads FastAPI's /openapi.json (served next to /api). */
+    async hasRoute(path) {
+      if (mode !== 'live') return false;
+      try {
+        const root = base.replace(/\/api$/, '');
+        const res = await fetch(root + '/openapi.json', { headers: { Accept: 'application/json' } });
+        if (!res.ok) return false;
+        const spec = await res.json();
+        return Object.keys(spec.paths || {}).some(p => p === '/api' + path || p.startsWith('/api' + path + '/') || p.startsWith('/api' + path + '?'));
+      } catch (e) { return false; }
+    },
+
+    /** GET /api/export: all results as JSON from the server */
+    async exportResults() {
+      if (mode !== 'live') demoOnly('Экспорт результатов с сервера');
+      return req('GET', EXPORT_PATH, null, 60000);
     },
 
     async getAppeals(status) {

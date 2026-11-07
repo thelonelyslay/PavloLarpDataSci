@@ -532,6 +532,8 @@
     }
     if (titleEl) titleEl.innerHTML = '';
     document.body.classList.toggle('is-chat', !isVoice);
+    const tlCard = document.querySelector('.timeline-card');
+    if (tlCard) tlCard.style.display = isVoice ? '' : 'none';
 
     // Player: real audio for calls; for chats only the timeline
     const audio = document.getElementById('html5-audio-element');
@@ -910,7 +912,7 @@
           </div>
         </div>
         <div class="weights-row">${weightsHtml}</div>
-        <div class="criterion-explanation">${escapeHtml(crit.explanation || '—')}</div>
+        <div class="criterion-explanation">${crit.appeal && crit.appeal.status !== 'open' && crit.appeal.decision ? '<span class="expl-label">Модель:</span> ' : ''}${escapeHtml(crit.explanation || '—')}</div>
         ${rulesHtml}
         ${naHtml}
         ${evidenceHtml}
@@ -1019,10 +1021,20 @@
     const def = critDef(ev, crit.id);
     const st = critStatus(def, crit);
     const lostAny = (ev.criteria || []).some(c => ['bad', 'part', 'flag'].includes(critStatus(critDef(ev, c.id), c)));
-    if (whyT) whyT.textContent = st === 'ok' ? (lostAny ? 'Критерий выполнен' : 'Оценка не снижена') : st === 'na' ? 'Почему N/A' : st === 'flag' ? 'Грубая ошибка' : 'Почему снижена оценка';
-    if (whyX) {
-      const extra = st === 'na' ? (crit.na_reason || (def && def.na_condition) || '') : '';
-      whyX.innerHTML = `<span class="why-crit">${escapeHtml(crit.title)}:</span> ${escapeHtml(extra || crit.explanation || '—')}`;
+    const decided = crit.appeal && crit.appeal.status !== 'open' && crit.appeal.decision;
+    if (decided) {
+      // After the reviewer's decision the reviewer's reason replaces the model's explanation
+      const accepted = crit.appeal.decision === 'change';
+      const orig = crit.original_answer !== undefined && crit.original_answer !== null ? crit.original_answer : crit.answer;
+      if (whyT) whyT.textContent = accepted ? 'Решение проверяющего: оценка изменена' : 'Решение проверяющего: оценка оставлена';
+      if (whyX) whyX.innerHTML = `<span class="why-crit">${escapeHtml(crit.title)}:</span> ${escapeHtml(crit.appeal.reason || '—')}`
+        + (accepted ? `<div class="why-sub">Было: ${answerView(def, crit, orig).text} → стало: ${answerView(def, crit).text}</div>` : '');
+    } else {
+      if (whyT) whyT.textContent = st === 'ok' ? (lostAny ? 'Критерий выполнен' : 'Оценка не снижена') : st === 'na' ? 'Почему N/A' : st === 'flag' ? 'Грубая ошибка' : 'Почему снижена оценка';
+      if (whyX) {
+        const extra = st === 'na' ? (crit.na_reason || (def && def.na_condition) || '') : '';
+        whyX.innerHTML = `<span class="why-crit">${escapeHtml(crit.title)}:</span> ${escapeHtml(extra || crit.explanation || '—')}`;
+      }
     }
     if (go) { go.disabled = !range; go.onclick = () => range && scrollToReplica(range[0], range[1]); }
     if (dis) {
@@ -1186,6 +1198,7 @@
       `;
     }
 
+    updateExportButton();
     const grid = document.getElementById('lang-channel-grid');
     if (grid) {
       const n = totalConvs;
@@ -1706,6 +1719,29 @@
     download(`cqa_results_${new Date().toISOString().slice(0, 10)}.csv`, '\uFEFF' + lines.join('\n'), 'text/csv;charset=utf-8');
   }
 
+  // "Экспорт результатов (JSON)": the server builds the file (GET /api/export). Disabled until the route exists.
+  async function updateExportButton() {
+    const btn = document.getElementById('btn-export-server');
+    if (!btn) return;
+    if (state.exportAvailable === undefined && isLive()) state.exportAvailable = await api().hasRoute(EXPORT_PATH);
+    const on = isLive() && state.exportAvailable === true;
+    btn.disabled = !on;
+    btn.title = !isLive() ? 'Только с сервером' : on ? 'Скачать все результаты с сервера' : 'Маршрут экспорта на сервере ещё не готов (GET /api' + EXPORT_PATH + ')';
+  }
+  async function exportFromServer() {
+    const btn = document.getElementById('btn-export-server');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Готовим файл…'; }
+    try {
+      const data = await api().exportResults();
+      download(`cqa_export_${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(data, null, 2), 'application/json');
+    } catch (e) {
+      toast('Экспорт не удался: ' + e.message);
+    } finally {
+      if (btn) { btn.textContent = '💾 Экспорт результатов (JSON)'; }
+      updateExportButton();
+    }
+  }
+
   function exportJSON() {
     const payload = {
       exported_at: new Date().toISOString(),
@@ -1850,6 +1886,8 @@
     const exportCsvBtn = document.getElementById('btn-export-csv');
     if (exportCsvBtn) exportCsvBtn.onclick = exportCSV;
 
+    const exportServerBtn = document.getElementById('btn-export-server');
+    if (exportServerBtn) exportServerBtn.onclick = exportFromServer;
     const exportJsonBtn = document.getElementById('btn-export-json');
     if (exportJsonBtn) exportJsonBtn.onclick = exportJSON;
 

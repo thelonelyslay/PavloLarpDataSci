@@ -1501,3 +1501,6 @@ body { flex-direction: row; background: var(--page-bg); }
 .toast-ok { background: #0d3f26; color: #fff; }
 .toast-bad { background: #b42318; color: #fff; }
 .batch-hint { font-size: 11px; color: var(--text-muted); }
+.why-sub { font-size: 13px; color: #555; margin-top: 4px; }
+.expl-label { font-weight: 700; color: var(--text-muted); }
+#btn-export-server:disabled { opacity: .5; cursor: not-allowed; }
