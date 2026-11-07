@@ -32,7 +32,9 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 DEV = ROOT / "data" / "raw" / "dev.json"
 CHECKLIST_FILES = [HERE / "checklist.default.json", HERE / "checklist.calls.json"]  # first = default
-DEFAULT_OPTS = {"effort": "low", "gemini_thinking": "auto"}
+DEFAULT_OPTS = {"gemini_thinking": "auto"}
+DEFAULT_EFFORT = "low"  # Claude effort when neither opts nor .env (EVAL_EFFORT) set it
+EFFORT_LEVELS = ("low", "medium", "high")
 ATTEMPTS_PER_MODEL = 2  # 1 retry on API error (after HTTP retries) or invalid answer, then next model
 DEFAULT_TIMEOUT = 120.0  # seconds for one evaluation, all models together; .env: EVAL_TIMEOUT
 CRITERION_TYPES = ("yes_no", "scale", "flag")
@@ -176,6 +178,14 @@ def build_result(record: dict, checklist: dict, answers: dict, details: dict,
     }
 
 
+def effort_from_env(env: dict) -> str:
+    """Claude effort from EVAL_EFFORT in .env (low/medium/high), DEFAULT_EFFORT if not set."""
+    value = (env.get("EVAL_EFFORT") or DEFAULT_EFFORT).strip().lower()
+    if value not in EFFORT_LEVELS:
+        raise EvaluationError(f"EVAL_EFFORT в .env должен быть одним из {', '.join(EFFORT_LEVELS)}, сейчас {value!r}")
+    return value
+
+
 def _timeout(env: dict) -> float:
     try:
         return float(env.get("EVAL_TIMEOUT") or DEFAULT_TIMEOUT)
@@ -189,8 +199,8 @@ def evaluate(record: dict, checklist: Optional[dict] = None, model_name: Optiona
     """Return the evaluation JSON from AGENTS.md; field `model` is the model that actually answered.
 
     checklist: None -> chosen by the record's channel (checklist_for_channel)
-    opts:  {"effort": Claude effort, "gemini_thinking": ...} (defaults in DEFAULT_OPTS)
-    env:   settings/keys (default: .env); EVAL_MODELS, EVAL_TIMEOUT
+    opts:  {"effort": Claude effort, "gemini_thinking": ...}; effort defaults to EVAL_EFFORT (else "low")
+    env:   settings/keys (default: .env); EVAL_MODELS, EVAL_TIMEOUT, EVAL_EFFORT
     stats: optional dict filled with seconds, tokens, attempts, errors, warnings, params (for comparisons)
     Raises ChecklistError if the checklist is invalid, EvaluationError if every model failed
     or the time limit EVAL_TIMEOUT (default 120 s) is over.
@@ -202,7 +212,8 @@ def evaluate(record: dict, checklist: Optional[dict] = None, model_name: Optiona
         validate_checklist_fields(checklist)
         scoring.validate_checklist(checklist)
     deadline = time.monotonic() + _timeout(env)
-    opts = {**DEFAULT_OPTS, **(opts or {}), "deadline": deadline}
+    opts = {**DEFAULT_OPTS, **{k: v for k, v in (opts or {}).items() if v is not None}, "deadline": deadline}
+    opts.setdefault("effort", effort_from_env(env))  # explicit opts["effort"] wins over EVAL_EFFORT
     stats = {} if stats is None else stats
     stats.update(model=None, seconds=0.0, input_tokens=0, output_tokens=0, cost_usd=None,
                  attempts=0, errors=[], warnings=[], params=None)
