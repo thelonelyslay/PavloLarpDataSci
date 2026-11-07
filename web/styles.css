@@ -916,7 +916,7 @@ body {
 }
 
 /* APPEALS CENTER VIEW */
-.appeals-view-container, .checklist-view-container, .pitch-view-container {
+.appeals-view-container, .checklist-view-container, .analytics-view-container {
   padding: 24px 32px;
   width: 100%;
   height: 100%;
@@ -1031,67 +1031,103 @@ body {
   cursor: pointer;
 }
 
-/* 5-MINUTE PITCH VIEW */
-.pitch-grid {
+/* EXECUTIVE ANALYTICS DASHBOARD */
+.kpi-grid {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 16px;
 }
 
-.pitch-step-card {
+.kpi-card {
   background: #ffffff;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  padding: 16px;
+  padding: 16px 18px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 4px;
   box-shadow: var(--shadow-sm);
 }
 
-.pitch-step-card.active-step {
-  border-color: var(--primary);
-  box-shadow: 0 0 0 2px var(--primary-light);
-}
-
-.step-time-badge {
-  background: var(--primary-dark);
-  color: #ffffff;
-  padding: 2px 8px;
-  border-radius: 10px;
+.kpi-title {
   font-size: 11px;
   font-weight: 700;
-  align-self: flex-start;
+  text-transform: uppercase;
+  color: var(--text-muted);
 }
 
-.pitch-step-card h3 {
-  font-size: 15px;
+.kpi-val {
+  font-size: 28px;
+  font-weight: 800;
+  color: var(--primary-dark);
+}
+
+.kpi-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.analytics-charts-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.export-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.lang-channel-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.stat-pill-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: #f8fafc;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+}
+
+.distrib-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  font-size: 12px;
+}
+
+.distrib-bar-label {
+  min-width: 140px;
+  color: var(--text-main);
+  font-weight: 500;
+}
+
+.distrib-bar-track {
+  flex: 1;
+  height: 8px;
+  background: #e2e8f0;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.distrib-bar-fill {
+  height: 100%;
+  border-radius: 4px;
+  transition: width 0.3s ease;
+}
+
+.distrib-bar-val {
+  min-width: 45px;
+  text-align: right;
   font-weight: 700;
   color: var(--text-main);
-}
-
-.pitch-step-card p {
-  font-size: 12px;
-  color: var(--text-muted);
-  line-height: 1.45;
-}
-
-.pitch-action-btn {
-  margin-top: auto;
-  background: var(--primary-light);
-  color: var(--primary-dark);
-  border: 1px solid var(--primary-border);
-  padding: 8px 12px;
-  border-radius: var(--radius-sm);
-  font-weight: 600;
-  font-size: 12px;
-  cursor: pointer;
-  text-align: center;
-}
-
-.pitch-action-btn:hover {
-  background: var(--primary);
-  color: #ffffff;
 }
 
 /* MODAL DIALOGS */

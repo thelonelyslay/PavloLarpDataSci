@@ -14,24 +14,24 @@
       <div class="brand-logo">F</div>
       <div class="brand-text">
         <h1>FREEDOM BROKER</h1>
-        <p>CQA · Conversation Quality Analytics | NU Data Challenge</p>
+        <p>Conversation Quality Analytics · Enterprise CQA System</p>
       </div>
     </div>
 
     <!-- TABS NAVIGATION -->
     <nav class="nav-tabs">
       <button class="nav-tab-btn active" data-tab="tab-workspace" id="nav-btn-workspace">
-        <span>💬 Диалоги и оценка</span>
+        <span>💬 Мониторинг диалогов</span>
       </button>
       <button class="nav-tab-btn" data-tab="tab-appeals" id="nav-btn-appeals">
-        <span>⚖️ Центр апелляций</span>
+        <span>⚖️ Арбитраж и апелляции</span>
         <span class="nav-badge" id="appeals-badge-count">1</span>
       </button>
-      <button class="nav-tab-btn" data-tab="tab-checklist" id="nav-btn-checklist">
-        <span>⚙️ Конструктор чек-листа</span>
+      <button class="nav-tab-btn" data-tab="tab-analytics" id="nav-btn-analytics">
+        <span>📊 Сводная аналитика</span>
       </button>
-      <button class="nav-tab-btn" data-tab="tab-pitch" id="nav-btn-pitch">
-        <span>⏱️ Гид по защите (5 мин)</span>
+      <button class="nav-tab-btn" data-tab="tab-checklist" id="nav-btn-checklist">
+        <span>⚙️ Стандарты и чек-листы</span>
       </button>
     </nav>
 
@@ -236,61 +236,99 @@
       </div>
     </div>
 
-    <!-- TAB 4: 5-MINUTE PITCH GUIDE -->
-    <div class="tab-content" id="tab-pitch">
-      <div class="pitch-view-container">
+    <!-- TAB 3: ANALYTICS & EXECUTIVE REPORTING -->
+    <div class="tab-content" id="tab-analytics">
+      <div class="analytics-view-container">
         <div class="view-header">
           <div>
-            <h2>Сценарий защиты за 5 минут (Регламент хакатона)</h2>
-            <p>Пошаговый пульт для демонстрации решения жюри согласно таймингу из задания</p>
+            <h2>Сводная аналитика качества обслуживания (Executive QA Dashboard)</h2>
+            <p>Комплексный мониторинг соблюдения стандартов сервиса, эффективности работы операторов и комплаенс-рисков</p>
+          </div>
+          <div class="export-actions">
+            <button class="btn-secondary" id="btn-export-json">💾 Экспорт в JSON</button>
+            <button class="btn-primary" id="btn-export-csv">📥 Экспорт отчета в CSV</button>
           </div>
         </div>
 
-        <div class="pitch-grid">
-          <!-- STEP 1 -->
-          <div class="pitch-step-card active-step">
-            <span class="step-time-badge">1 минута</span>
-            <h3>1. Интерфейс и диалог</h3>
-            <p>Покажите единый рабочий стол: список диалогов, фильтрацию по языкам (RU, KZ, EN), номер реплики у каждого сообщения, понятную навигацию.</p>
-            <button class="pitch-action-btn" onclick="demoStep1()">Показать типовой диалог (p1-ru-001) ↗</button>
+        <!-- TOP KPI CARDS -->
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <span class="kpi-title">Средний CQA Index</span>
+            <div class="kpi-val" id="kpi-avg-score">88.4%</div>
+            <span class="kpi-sub">Целевой норматив: ≥ 85.0%</span>
           </div>
-
-          <!-- STEP 2 -->
-          <div class="pitch-step-card">
-            <span class="step-time-badge">2 минуты</span>
-            <h3>2. Оценка, цитаты и N/A</h3>
-            <p>Покажите карточку оценки: расчет весов, клик по цитате с мгновенным переходом и подсветкой реплики, а также пример N/A и перерасчета весов.</p>
-            <button class="pitch-action-btn" onclick="demoStep2()">Показать N/A и переход к цитате (p1-ru-025) ↗</button>
+          <div class="kpi-card">
+            <span class="kpi-title">Проверено обращений</span>
+            <div class="kpi-val" id="kpi-total-convs">65</div>
+            <span class="kpi-sub">60 чатов · 5 аудиозвонков</span>
           </div>
-
-          <!-- STEP 3 -->
-          <div class="pitch-step-card">
-            <span class="step-time-badge">1 минута</span>
-            <h3>3. Апелляция и пересмотр</h3>
-            <p>Покажите процесс оспаривания оценки оператором, панель проверяющего (QC), принятие решения и автоматический пересчет итогового балла.</p>
-            <button class="pitch-action-btn" onclick="demoStep3()">Показать апелляцию (p1-ru-014) ↗</button>
+          <div class="kpi-card">
+            <span class="kpi-title">Инциденты комплаенс</span>
+            <div class="kpi-val" id="kpi-gross-errors" style="color: var(--danger);">1</div>
+            <span class="kpi-sub">Грубые ошибки регламента</span>
           </div>
-
-          <!-- STEP 4 -->
-          <div class="pitch-step-card">
-            <span class="step-time-badge">1 минута</span>
-            <h3>4. Замена критерия</h3>
-            <p>Покажите изменение чек-листа в интерфейсе и его мгновенное применение к выданным диалогам (главное контрольное задание 23-го часа!).</p>
-            <button class="pitch-action-btn" onclick="demoStep4()">Перейти в конструктор чек-листа ↗</button>
+          <div class="kpi-card">
+            <span class="kpi-title">Индекс апелляций</span>
+            <div class="kpi-val" id="kpi-appeals-count" style="color: var(--warning);">1</div>
+            <span class="kpi-sub">Обращений на пересмотр</span>
           </div>
         </div>
 
-        <div class="data-table-card" style="padding: 20px; background: #ffffff;">
-          <h3 style="margin-bottom: 10px;">⚡ Быстрый переход к контрольным кейсам хакатона:</h3>
-          <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-            <button class="btn-secondary" onclick="app.selectConversation('p1-ru-001')">💬 Идеальный чат RU (p1-ru-001)</button>
-            <button class="btn-secondary" onclick="app.selectConversation('p1-kz-001')">🇰🇿 Казахский диалог (p1-kz-001)</button>
-            <button class="btn-secondary" onclick="app.selectConversation('p1-en-001')">🇬🇧 Английский диалог (p1-en-001)</button>
-            <button class="btn-secondary" onclick="app.selectConversation('p4-ru-003')">📞 Реальный звонок с аудио (p4-ru-003)</button>
-            <button class="btn-secondary" onclick="app.selectConversation('p1-ru-022')">🚨 Грубая ошибка оператора (p1-ru-022)</button>
-            <button class="btn-secondary" onclick="app.selectConversation('p1-ru-025')">🔄 Чат с N/A и перерасчетом (p1-ru-025)</button>
+        <!-- ANALYTICS SECTIONS -->
+        <div class="analytics-charts-grid">
+          <div class="data-table-card" style="padding: 20px;">
+            <h3 style="font-size: 15px; margin-bottom: 14px;">Распределение качества диалогов</h3>
+            <div class="distrib-bars" id="distrib-bars-container">
+              <!-- Rendered dynamically -->
+            </div>
+          </div>
+
+          <div class="data-table-card" style="padding: 20px;">
+            <h3 style="font-size: 15px; margin-bottom: 14px;">Показатели по каналам и языковым группам</h3>
+            <div class="lang-channel-grid">
+              <div class="stat-pill-row">
+                <span>💬 Текстовые чаты (agent chat):</span>
+                <strong>60 обращений</strong>
+              </div>
+              <div class="stat-pill-row">
+                <span>📞 Голосовые звонки (voice call):</span>
+                <strong>5 аудиосессий</strong>
+              </div>
+              <div class="stat-pill-row">
+                <span>🇷🇺 Русский язык (RU):</span>
+                <strong>35 диалогов (54%)</strong>
+              </div>
+              <div class="stat-pill-row">
+                <span>🇰🇿 Казахский язык (KZ):</span>
+                <strong>15 диалогов (23%)</strong>
+              </div>
+              <div class="stat-pill-row">
+                <span>🇬🇧 Английский язык (EN):</span>
+                <strong>15 диалогов (23%)</strong>
+              </div>
+            </div>
           </div>
         </div>
+
+        <!-- CRITERIA PERFORMANCE TABLE -->
+        <div class="data-table-card" style="padding: 20px;">
+          <h3 style="font-size: 15px; margin-bottom: 14px;">Соблюдение регламентов по критериям контроля качества</h3>
+          <table class="custom-table">
+            <thead>
+              <tr>
+                <th>Критерий оценки</th>
+                <th>Секция</th>
+                <th>Базовый вес</th>
+                <th>Уровень соблюдения</th>
+                <th>Статус критерия</th>
+              </tr>
+            </thead>
+            <tbody id="analytics-criteria-body">
+              <!-- Rendered dynamically -->
+            </tbody>
+          </table>
+        </div>
+
       </div>
     </div>
 

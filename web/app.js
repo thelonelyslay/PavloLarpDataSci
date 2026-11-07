@@ -201,6 +201,7 @@
     renderEvaluationCard();
     renderAppealsTable();
     renderChecklistTable();
+    renderAnalyticsDashboard();
   }
 
   // 1. CONVERSATIONS SIDEBAR
@@ -989,6 +990,156 @@
 
     const applyChkBtn = document.getElementById('btn-apply-checklist-changes');
     if (applyChkBtn) applyChkBtn.onclick = applyChecklistChanges;
+
+    // Analytics export
+    const exportCsvBtn = document.getElementById('btn-export-csv');
+    if (exportCsvBtn) exportCsvBtn.onclick = exportCSV;
+
+    const exportJsonBtn = document.getElementById('btn-export-json');
+    if (exportJsonBtn) exportJsonBtn.onclick = exportJSON;
+  }
+
+  // 6. EXECUTIVE ANALYTICS DASHBOARD
+  function renderAnalyticsDashboard() {
+    const totalConvs = state.conversations.length;
+    if (totalConvs === 0) return;
+
+    const validScores = state.conversations.filter(c => c.total_score !== null).map(c => c.total_score);
+    const avgScore = validScores.length > 0 ? (validScores.reduce((a, b) => a + b, 0) / validScores.length) : 0;
+    const grossErrors = state.conversations.filter(c => c.gross_error).length;
+    const appealsCount = state.appeals.length;
+
+    const avgEl = document.getElementById('kpi-avg-score');
+    const totalEl = document.getElementById('kpi-total-convs');
+    const grossEl = document.getElementById('kpi-gross-errors');
+    const appealsEl = document.getElementById('kpi-appeals-count');
+
+    if (avgEl) avgEl.textContent = avgScore.toFixed(1) + '%';
+    if (totalEl) totalEl.textContent = totalConvs;
+    if (grossEl) grossEl.textContent = grossErrors;
+    if (appealsEl) appealsEl.textContent = appealsCount;
+
+    // Grade distribution
+    const excellent = state.conversations.filter(c => c.total_score >= 90).length;
+    const good = state.conversations.filter(c => c.total_score >= 70 && c.total_score < 90).length;
+    const fair = state.conversations.filter(c => c.total_score !== null && c.total_score < 70).length;
+
+    const distribContainer = document.getElementById('distrib-bars-container');
+    if (distribContainer) {
+      distribContainer.innerHTML = `
+        <div class="distrib-bar-row">
+          <span class="distrib-bar-label">Отлично (≥ 90%):</span>
+          <div class="distrib-bar-track"><div class="distrib-bar-fill" style="width: ${(excellent / totalConvs) * 100}%; background: var(--success);"></div></div>
+          <span class="distrib-bar-val">${excellent} (${Math.round((excellent / totalConvs) * 100)}%)</span>
+        </div>
+        <div class="distrib-bar-row">
+          <span class="distrib-bar-label">Хорошо (70–89%):</span>
+          <div class="distrib-bar-track"><div class="distrib-bar-fill" style="width: ${(good / totalConvs) * 100}%; background: var(--info);"></div></div>
+          <span class="distrib-bar-val">${good} (${Math.round((good / totalConvs) * 100)}%)</span>
+        </div>
+        <div class="distrib-bar-row">
+          <span class="distrib-bar-label">Требует внимания (&lt; 70%):</span>
+          <div class="distrib-bar-track"><div class="distrib-bar-fill" style="width: ${(fair / totalConvs) * 100}%; background: var(--warning);"></div></div>
+          <span class="distrib-bar-val">${fair} (${Math.round((fair / totalConvs) * 100)}%)</span>
+        </div>
+        <div class="distrib-bar-row">
+          <span class="distrib-bar-label">Грубые ошибки (Комплаенс):</span>
+          <div class="distrib-bar-track"><div class="distrib-bar-fill" style="width: ${(grossErrors / totalConvs) * 100}%; background: var(--danger);"></div></div>
+          <span class="distrib-bar-val" style="color: var(--danger);">${grossErrors} (${Math.round((grossErrors / totalConvs) * 100)}%)</span>
+        </div>
+      `;
+    }
+
+    // Criteria compliance table
+    const critTableBody = document.getElementById('analytics-criteria-body');
+    if (critTableBody) {
+      const checklist = state.checklists[state.activeChecklistKey] || state.checklists['default'];
+      if (checklist && checklist.criteria) {
+        critTableBody.innerHTML = '';
+        checklist.criteria.forEach(crit => {
+          let passedCount = 0;
+          let applicableCount = 0;
+
+          for (const cid in state.evaluations) {
+            const ev = state.evaluations[cid];
+            const cItem = ev.criteria && ev.criteria.find(c => c.id === crit.id);
+            if (cItem) {
+              if (crit.type === 'flag') {
+                applicableCount++;
+                if (cItem.answer === 'no') passedCount++;
+              } else if (cItem.applicable) {
+                applicableCount++;
+                if (crit.type === 'yes_no' && cItem.answer === 'yes') passedCount++;
+                else if (crit.type === 'scale') {
+                  const maxStep = Math.max(...(crit.steps || [20]));
+                  passedCount += Number(cItem.answer || 0) / maxStep;
+                }
+              }
+            }
+          }
+
+          const complianceRate = applicableCount > 0 ? Math.round((passedCount / applicableCount) * 100) : 100;
+          let statusBadge = '<span class="badge score-perfect">Норматив выполнен</span>';
+          if (complianceRate < 75) statusBadge = '<span class="badge score-poor">Критическая зона</span>';
+          else if (complianceRate < 85) statusBadge = '<span class="badge score-fair">Требует коучинга</span>';
+
+          const tr = document.createElement('tr');
+          tr.innerHTML = `
+            <td><strong>${escapeHtml(crit.title)}</strong></td>
+            <td><span class="badge badge-chat">${escapeHtml(crit.section || '—')}</span></td>
+            <td><strong>${crit.weight}</strong></td>
+            <td>
+              <div style="display: flex; align-items: center; gap: 8px;">
+                <div style="width: 80px; height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden;">
+                  <div style="width: ${complianceRate}%; height: 100%; background: ${complianceRate >= 85 ? 'var(--primary)' : (complianceRate >= 75 ? 'var(--warning)' : 'var(--danger)')};"></div>
+                </div>
+                <strong>${complianceRate}%</strong>
+              </div>
+            </td>
+            <td>${statusBadge}</td>
+          `;
+          critTableBody.appendChild(tr);
+        });
+      }
+    }
+  }
+
+  function exportCSV() {
+    const headers = ['ID диалога', 'Канал', 'Язык', 'Итоговый балл CQA', 'Грубая ошибка', 'Апелляция'];
+    const rows = state.conversations.map(c => [
+      c.conversation_id,
+      `"${c.channel}"`,
+      c.language,
+      c.total_score !== null ? c.total_score : 'N/A',
+      c.gross_error ? 'ДА' : 'НЕТ',
+      c.has_appeal ? 'ДА' : 'НЕТ'
+    ]);
+
+    let csvContent = 'data:text/csv;charset=utf-8,\uFEFF'
+      + [headers.join(';'), ...rows.map(e => e.join(';'))].join('\n');
+
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement('a');
+    link.setAttribute('href', encodedUri);
+    link.setAttribute('download', `freedom_broker_cqa_report_${new Date().toISOString().slice(0, 10)}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  }
+
+  function exportJSON() {
+    const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify({
+      exported_at: new Date().toISOString(),
+      conversations: state.conversations,
+      evaluations: state.evaluations,
+      checklist: state.checklists[state.activeChecklistKey] || state.checklists['default']
+    }, null, 2));
+    const downloadAnchor = document.createElement('a');
+    downloadAnchor.setAttribute('href', dataStr);
+    downloadAnchor.setAttribute('download', `freedom_broker_cqa_export_${new Date().toISOString().slice(0, 10)}.json`);
+    document.body.appendChild(downloadAnchor);
+    downloadAnchor.click();
+    downloadAnchor.remove();
   }
 
   // --- UTILS ---
@@ -1015,7 +1166,7 @@
     return ts;
   }
 
-  // Global exports for inline onclick handlers and pitch demo
+  // Global exports for inline onclick handlers
   window.app = {
     selectConversation,
     selectConversationAndTab,
@@ -1024,28 +1175,9 @@
     openReviewModal,
     openEditCriterionModal,
     deleteCriterion,
-    closeModal
-  };
-
-  window.demoStep1 = () => {
-    selectConversation('p1-ru-001');
-    switchTab('tab-workspace');
-  };
-
-  window.demoStep2 = () => {
-    selectConversation('p1-ru-025');
-    switchTab('tab-workspace');
-    setTimeout(() => scrollToReplica(9), 300);
-  };
-
-  window.demoStep3 = () => {
-    selectConversation('p1-ru-014');
-    switchTab('tab-workspace');
-    setTimeout(() => openReviewModal('p1-ru-014', 'contact'), 400);
-  };
-
-  window.demoStep4 = () => {
-    switchTab('tab-checklist');
+    closeModal,
+    exportCSV,
+    exportJSON
   };
 
   // Run on DOM loaded
