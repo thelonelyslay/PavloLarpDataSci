@@ -90,6 +90,52 @@ def _load_evaluation(evaluation_id: str) -> tuple[dict, dict]:
     return dict(row), json.loads(row["result_json"])
 
 
+def _cache_key(record: dict, checklist: dict, checklist_id: str) -> str:
+    """Cache key of one evaluation (the formula src/cqa/export_results.py repeats; keep them equal)."""
+    source = json.dumps({"conversation_id": record["id"], "transcript": record["transcript"], "language": record["language"],
+                         "channel": record["channel"], "checklist": checklist, "checklist_id": checklist_id,
+                         "models": os.environ.get("EVAL_MODELS", "")}, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+# Fields the model never sees (src/cqa/prompting.py): they only change the scoring, not the answers.
+# version and name are in the prompt header but do not change the criteria, so they are ignored too.
+_SCORING_ONLY_CRITERION_KEYS = {"weight", "section"}
+_SCORING_ONLY_CHECKLIST_KEYS = {"id", "base_id", "active", "version", "name", "rounding"}
+
+
+def _prompt_fingerprint(checklist: dict) -> str:
+    """Everything that can change the model's answers: criteria without weight/section, notes, channel."""
+    top = {k: v for k, v in checklist.items() if k not in _SCORING_ONLY_CHECKLIST_KEYS and k != "criteria"}
+    criteria = [{k: v for k, v in c.items() if k not in _SCORING_ONLY_CRITERION_KEYS}
+                for c in checklist.get("criteria", [])]
+    return json.dumps({"checklist": top, "criteria": criteria}, sort_keys=True, ensure_ascii=False)
+
+
+def _reusable_evaluation(record: dict, checklist: dict, checklist_id: str):
+    """A successful evaluation of this dialog by ANOTHER checklist version that differs only in weights.
+
+    Conditions: same prompt fingerprint, and its stored cache key still matches when recomputed with its own
+    checklist, i.e. the transcript and the model chain (EVAL_MODELS) did not change since then.
+    The same checklist version is never reused here (after an appeal it is deliberately evaluated again).
+    """
+    fingerprint = _prompt_fingerprint(checklist)
+    with _connect() as db:
+        rows = db.execute("""SELECT e.*, c.checklist_json AS old_checklist_json FROM evaluations e
+            JOIN checklists c ON c.id = e.checklist_id
+            WHERE e.conversation_id = ? AND e.checklist_id != ? AND e.model != 'ERROR'
+              AND e.cache_key IS NOT NULL AND c.applies_to = ?
+            ORDER BY e.rowid DESC""", (record["id"], checklist_id, record["channel"])).fetchall()
+    for row in rows:
+        old_checklist = json.loads(row["old_checklist_json"])
+        if _prompt_fingerprint(old_checklist) != fingerprint:
+            continue
+        if _cache_key(record, old_checklist, row["checklist_id"]) != row["cache_key"]:
+            continue  # the transcript or the model chain changed: the old answers may not hold
+        return row
+    return None
+
+
 @router.post("/evaluations")
 def create_evaluation(request: dict) -> dict:
     supplied = request.get("conversation") or request.get("record")
@@ -114,10 +160,7 @@ def create_evaluation(request: dict) -> dict:
     checklist = json.loads(row["checklist_json"])
     if row["applies_to"] != record["channel"]:
         raise HTTPException(status_code=422, detail="Канал чек-листа не совпадает с каналом диалога")
-    source = json.dumps({"conversation_id": record["id"], "transcript": record["transcript"], "language": record["language"],
-                         "channel": record["channel"], "checklist": checklist, "checklist_id": row["id"],
-                         "models": os.environ.get("EVAL_MODELS", "")}, sort_keys=True, ensure_ascii=False)
-    cache_key = hashlib.sha256(source.encode("utf-8")).hexdigest()
+    cache_key = _cache_key(record, checklist, row["id"])
     with _connect() as db:
         cached = db.execute("""SELECT result_json FROM evaluations e WHERE cache_key = ? AND model != 'ERROR'
             AND NOT EXISTS (SELECT 1 FROM appeals a WHERE a.evaluation_id = e.id)
@@ -125,6 +168,27 @@ def create_evaluation(request: dict) -> dict:
                             (cache_key,)).fetchone()
     if cached:
         return json.loads(cached["result_json"])
+    reused = _reusable_evaluation(record, checklist, row["id"])
+    if reused is not None:
+        # Only weights/sections changed: rescore the model's original answers, no model call, cost 0.
+        original = json.loads(reused["answers_json"])
+        old_result = json.loads(reused["result_json"])
+        details = {c["id"]: {"explanation": c.get("explanation", ""), "evidence": c.get("evidence", [])}
+                   for c in old_result.get("criteria", [])}
+        try:
+            result = _compose(uuid4().hex, record, row["id"], checklist, reused["model"], 0.0, "done",
+                              original, original, details)
+        except (ValueError, KeyError):
+            result = None  # answers do not fit the new checklist after all: evaluate normally below
+        if result is not None:
+            with _connect() as db:
+                db.execute("""INSERT INTO evaluations (id, conversation_id, checklist_id, checklist_version,
+                    model, answers_json, result_json, total, duration_seconds, input_tokens, output_tokens,
+                    cost_usd, cache_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, ?)""",
+                    (result["id"], conversation_id, row["id"], row["version"], reused["model"],
+                     json.dumps(original, ensure_ascii=False), json.dumps(result, ensure_ascii=False),
+                     result["total"], cache_key))
+            return result
     try:
         result, stats = _run_engine(record, checklist)
         answers = {c["id"]: c["original_answer"] for c in result["criteria"]}
@@ -211,13 +275,19 @@ def create_batch(request: dict) -> dict:
     return {"status": "done", "completed": len(results), "total": len(ids), "results": results}
 
 
+BATCH_WORKERS = 4  # parallel dialogs in a background job, like src/cqa/export_results.py --workers
+
+
 def _run_batch_job(job_id: str, ids: list[str], checklist_id: Optional[str]) -> None:
-    for cid in ids:
+    def one(cid: str) -> None:
         result = create_batch({"conversation_ids": [cid], "checklist_id": checklist_id})["results"][0]
         with _jobs_lock:
             job = _jobs[job_id]
-            job["results"].append(result)
+            job["results"].append(result)  # completion order; the UI reads new items by count
             job["completed"] += 1
+
+    with ThreadPoolExecutor(max_workers=BATCH_WORKERS) as pool:
+        list(pool.map(one, ids))  # each create_evaluation uses its own SQLite connection
     with _jobs_lock:
         _jobs[job_id]["status"] = "done"
 
