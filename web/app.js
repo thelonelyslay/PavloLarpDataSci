@@ -1,7 +1,7 @@
 /**
  * Freedom Broker CQA (Conversation Quality Analytics) Frontend Application
  * Fully client-side, zero build required. Pure modern JavaScript.
- * Implements exact math and rules from src/cqa/scoring.py and AGENTS.md contract.
+ * Totals, points, model and cost come from the server (src/cqa/scoring.py). Nothing is recalculated here.
  */
 
 (function () {
@@ -25,173 +25,140 @@
     errorMessage: null
   };
 
-  // --- SCORING ENGINE (Deterministic math matching src/cqa/scoring.py) ---
-  function computeScore(checklist, answers) {
-    const digits = checklist.rounding || 2;
-    const scored = checklist.criteria.filter(c => c.type !== 'flag');
-    const flags = checklist.criteria.filter(c => c.type === 'flag');
-
-    const norm = {};
-    for (const c of checklist.criteria) {
-      let v = answers[c.id];
-      if (typeof v === 'string') {
-        const lower = v.trim().toLowerCase();
-        if (lower === 'да' || lower === 'yes' || lower === 'true') v = 'yes';
-        else if (lower === 'нет' || lower === 'no' || lower === 'false') v = 'no';
-        else if (lower === 'n/a' || lower === 'н/п' || lower === 'na') v = 'na';
-      }
-      norm[c.id] = v;
-    }
-
-    const earned = {};
-    const applicable = {};
-    let applicableWeight = 0;
-
-    for (const c of scored) {
-      const a = norm[c.id];
-      if (a === 'na') {
-        applicable[c.id] = false;
-        earned[c.id] = 0.0;
-      } else {
-        applicable[c.id] = true;
-        applicableWeight += c.weight;
-        if (c.type === 'yes_no') {
-          earned[c.id] = (a === 'yes') ? Number(c.weight) : 0.0;
-        } else if (c.type === 'scale') {
-          const maxStep = Math.max(...c.steps.map(Number));
-          earned[c.id] = maxStep > 0 ? (Number(a) / maxStep) * c.weight : 0.0;
-        }
-      }
-    }
-
-    let total = null;
-    if (applicableWeight > 0) {
-      const sumEarned = Object.values(earned).reduce((sum, val) => sum + val, 0);
-      total = Math.round((sumEarned / applicableWeight * 100) * 100) / 100;
-    }
-
-    const criteriaOut = scored.map(c => {
-      const isApp = applicable[c.id];
-      const effWeight = (isApp && applicableWeight > 0) ? Math.round((c.weight / applicableWeight * 100) * 100) / 100 : 0.0;
-      const points = (isApp && applicableWeight > 0) ? Math.round((earned[c.id] / applicableWeight * 100) * 100) / 100 : 0.0;
-      return {
-        id: c.id,
-        title: c.title,
-        section: c.section,
-        answer: norm[c.id],
-        applicable: isApp,
-        weight: c.weight,
-        effective_weight: effWeight,
-        points: points,
-        rules: c.rules || ''
-      };
-    });
-
-    const sections = {};
-    for (const c of scored) {
-      const sec = c.section || '—';
-      if (!sections[sec]) sections[sec] = { earned: 0.0, weight: 0.0 };
-      if (applicable[c.id]) {
-        sections[sec].earned += earned[c.id];
-        sections[sec].weight += c.weight;
-      }
-    }
-    const sectionScores = {};
-    for (const sec in sections) {
-      sectionScores[sec] = sections[sec].weight > 0 ? Math.round((sections[sec].earned / sections[sec].weight * 100) * 100) / 100 : null;
-    }
-
-    const grossErrorIds = flags.filter(c => norm[c.id] === 'yes').map(c => c.id);
-
-    return {
-      total,
-      criteria: criteriaOut,
-      section_scores: sectionScores,
-      gross_error: grossErrorIds.length > 0,
-      gross_error_ids: grossErrorIds
-    };
+  // --- SETTINGS (display thresholds only; they never change scores) ---
+  const SETTINGS_KEY = 'cqa_display_settings';
+  const DEFAULT_SETTINGS = { good: 70, excellent: 90, target: 85 };
+  function loadSettings() {
+    try { return Object.assign({}, DEFAULT_SETTINGS, JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}')); }
+    catch (e) { return Object.assign({}, DEFAULT_SETTINGS); }
   }
+  state.settings = loadSettings();
+  function saveSettings() { try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings)); } catch (e) { /* storage off */ } }
+  function scoreLevel(total) {
+    if (total === null || total === undefined) return 'none';
+    if (total >= state.settings.excellent) return 'excellent';
+    if (total >= state.settings.good) return 'good';
+    return 'low';
+  }
+
+  // --- HELPERS ---
+  const api = () => window.CQA_API;
+  const isLive = () => api() && api().isLive();
+  function activeChecklist() {
+    return state.checklists[state.activeChecklistKey] || Object.values(state.checklists)[0] || null;
+  }
+  function checklistOf(ev) {
+    return (ev && state.checklists[ev.checklist_id]) || activeChecklist();
+  }
+  function critDef(ev, critId) {
+    const cl = checklistOf(ev);
+    return cl && cl.criteria ? cl.criteria.find(c => c.id === critId) : null;
+  }
+  function finalAnswer(crit) {
+    return crit.final_answer !== undefined && crit.final_answer !== null ? crit.final_answer : crit.answer;
+  }
+  function answerView(def, crit, a) {
+    if (a === undefined) a = finalAnswer(crit);
+    const isFlag = (def && def.type === 'flag') || (!def && crit.weight === 0);
+    if (isFlag) return a === 'yes' ? { cls: 'ans-flag-active', text: '⚠️ НАРУШЕНИЕ' } : { cls: 'ans-flag-clear', text: 'НЕТ НАРУШЕНИЙ' };
+    if (a === 'na') return { cls: 'ans-na', text: 'N/A' };
+    if (a === 'yes') return { cls: 'ans-yes', text: 'ДА' };
+    if (a === 'no') return { cls: 'ans-no', text: 'НЕТ' };
+    if (typeof a === 'number' || /^\d+(\.\d+)?$/.test(String(a))) {
+      const max = def && def.steps ? Math.max(...def.steps.map(Number)) : null;
+      return { cls: 'ans-scale', text: `${a}${max ? ' из ' + max : ''}` };
+    }
+    return { cls: 'ans-na', text: '—' };
+  }
+  function fmt2(n) { return n === null || n === undefined || isNaN(n) ? '—' : Number(n).toFixed(2); }
+  function toast(msg) { showError(msg); setTimeout(hideError, 5000); }
 
   // --- INITIALIZATION ---
   async function init() {
-    // 1. Load Checklists
-    if (window.CQA_DEFAULT_CHECKLISTS) {
-      state.checklists = JSON.parse(JSON.stringify(window.CQA_DEFAULT_CHECKLISTS));
-    }
-    const savedChecklist = localStorage.getItem('cqa_custom_checklist');
-    if (savedChecklist) {
-      try {
-        state.checklists['custom'] = JSON.parse(savedChecklist);
-        state.activeChecklistKey = 'custom';
-      } catch (e) {
-        console.error('Failed to parse saved checklist', e);
-      }
-    }
-
-    // 2. Check saved API URL
-    const savedApiUrl = localStorage.getItem('cqa_api_url');
-    if (savedApiUrl && window.CQA_API) {
-      window.CQA_API.setBaseUrl(savedApiUrl);
-    }
-
-    // 3. Bind event listeners
     bindEvents();
-
-    // 4. Fetch data via unified API client
     await loadData();
   }
 
   async function loadData() {
     showLoading(true);
     hideError();
-
+    state.conversations = [];
+    state.evaluations = {};
     try {
-      if (window.CQA_API) {
-        const health = await window.CQA_API.checkHealth();
-        updateApiStatusUI(health);
-        state.conversations = await window.CQA_API.getConversations();
-      } else if (window.CQA_MOCK_DATA) {
-        state.conversations = JSON.parse(JSON.stringify(window.CQA_MOCK_DATA.conversations));
-      }
+      const health = await api().connect();
+      updateApiStatusUI(health);
 
-      if (state.conversations.length > 0 && !state.activeConvId) {
+      // Checklists: from the server (live) or from demo data (generated from src/cqa/checklist.*.json)
+      state.checklists = await api().getChecklists();
+      try {
+        const draft = JSON.parse(localStorage.getItem('cqa_checklist_draft') || 'null');
+        if (draft && draft.criteria) state.checklists['draft'] = draft;
+      } catch (e) { /* no draft */ }
+      if (!state.checklists[state.activeChecklistKey]) {
+        const keys = Object.keys(state.checklists).filter(k => k !== 'draft');
+        state.activeChecklistKey = keys.find(k => (state.checklists[k].applies_to || 'agent chat') === 'agent chat') || keys[0] || 'draft';
+      }
+      renderChecklistPicker();
+
+      state.conversations = await api().getConversations();
+      if (state.conversations.length > 0 && !state.conversations.find(c => c.conversation_id === state.activeConvId)) {
         state.activeConvId = state.conversations[0].conversation_id;
       }
-
-      // Load evaluation for active conversation
-      if (state.activeConvId) {
-        await ensureEvaluationLoaded(state.activeConvId);
-      }
+      if (state.activeConvId) await selectConversation(state.activeConvId, true);
 
       collectAppeals();
       renderAll();
     } catch (err) {
       console.error('Ошибка загрузки данных:', err);
-      showError(`Не удалось загрузить данные: ${err.message}. Проверьте сервер или используйте файл-заглушку.`);
+      showError(`Не удалось загрузить данные: ${err.message}`);
+      renderAll();
     } finally {
       showLoading(false);
     }
   }
 
-  async function ensureEvaluationLoaded(cid) {
-    if (!state.evaluations[cid] && window.CQA_API) {
-      try {
-        const ev = await window.CQA_API.getEvaluation(cid);
-        if (ev) state.evaluations[cid] = ev;
-      } catch (e) {
-        console.warn('Не удалось загрузить оценку для', cid, e);
-      }
+  async function ensureEvaluationLoaded(cid, force) {
+    if (state.evaluations[cid] && !force) return;
+    const conv = state.conversations.find(c => c.conversation_id === cid);
+    if (!conv) return;
+    try {
+      const ev = await api().getLatestEvaluation(conv);
+      if (ev) { state.evaluations[cid] = ev; syncConvFromEval(conv, ev); }
+      else delete state.evaluations[cid];
+    } catch (e) {
+      console.warn('Не удалось загрузить оценку для', cid, e);
     }
+  }
+
+  function syncConvFromEval(conv, ev) {
+    conv.total_score = ev.total;
+    conv.gross_error = Boolean(ev.gross_error);
+    conv.last_evaluation_id = ev.id;
+    conv.has_appeal = (ev.criteria || []).some(c => c.appeal && c.appeal.status === 'open');
+  }
+
+  function renderChecklistPicker() {
+    const sel = document.getElementById('checklist-picker');
+    if (!sel) return;
+    sel.innerHTML = Object.entries(state.checklists).map(([k, c]) => {
+      const n = (c.criteria || []).length;
+      const label = k === 'draft' ? `Черновик (не сохранён): ${c.name || ''}` : `${c.name || k} v${c.version || 1}`;
+      return `<option value="${escapeHtml(k)}" ${k === state.activeChecklistKey ? 'selected' : ''}>${escapeHtml(label)} · ${n} крит.</option>`;
+    }).join('');
   }
 
   function updateApiStatusUI(health) {
     const statusText = document.getElementById('api-status-text');
     const statusDot = document.querySelector('.status-dot');
+    const demoBanner = document.getElementById('demo-mode-banner');
     if (statusText) statusText.textContent = health.message;
     if (statusDot) {
-      statusDot.style.background = health.status === 'online' ? '#10b981' : '#f59e0b';
-      statusDot.style.boxShadow = `0 0 6px ${health.status === 'online' ? '#10b981' : '#f59e0b'}`;
+      const color = health.status === 'online' ? '#10b981' : '#f59e0b';
+      statusDot.style.background = color;
+      statusDot.style.boxShadow = `0 0 6px ${color}`;
     }
+    if (demoBanner) demoBanner.style.display = health.status === 'online' ? 'none' : 'flex';
+    document.body.classList.toggle('is-demo', health.status !== 'online');
   }
 
   function showLoading(show) {
@@ -225,7 +192,8 @@
               conversation_id: cid,
               criterion_id: crit.id,
               criterion_title: crit.title,
-              answer: crit.answer,
+              answer: finalAnswer(crit),
+              view: answerView(critDef(ev, crit.id), crit),
               appeal: crit.appeal
             });
           }
@@ -284,29 +252,26 @@
       const card = document.createElement('div');
       card.className = `conv-card ${conv.conversation_id === state.activeConvId ? 'active' : ''}`;
       card.onclick = () => selectConversation(conv.conversation_id);
+      const lang = String(conv.language || '').toLowerCase();
 
       const firstClientMsg = (conv.transcript && conv.transcript.find(m => m.speaker === 'client')) || (conv.transcript && conv.transcript[0]);
-      const snippet = firstClientMsg ? firstClientMsg.text : '...';
+      const snippet = firstClientMsg ? firstClientMsg.text : '';
 
-      let scoreClass = 'score-perfect';
-      if (conv.total_score === null) scoreClass = 'score-fair';
-      else if (conv.total_score >= 90) scoreClass = 'score-perfect';
-      else if (conv.total_score >= 70) scoreClass = 'score-good';
-      else if (conv.total_score >= 50) scoreClass = 'score-fair';
-      else scoreClass = 'score-poor';
+      const lvl = scoreLevel(conv.total_score);
+      const scoreClass = { excellent: 'score-perfect', good: 'score-good', low: 'score-poor', none: 'score-fair' }[lvl];
 
       card.innerHTML = `
         <div class="conv-card-top">
-          <span class="conv-id">${conv.conversation_id}</span>
+          <span class="conv-id">${escapeHtml(conv.conversation_id)}</span>
           <div class="conv-badges">
             <span class="badge ${conv.channel === 'voice call' ? 'badge-voice' : 'badge-chat'}">${conv.channel === 'voice call' ? '📞 Звонок' : '💬 Чат'}</span>
-            <span class="badge badge-${conv.language.toLowerCase()}">${conv.language}</span>
+            <span class="badge badge-${lang}">${escapeHtml(conv.language)}</span>
           </div>
         </div>
         <div class="conv-snippet">${escapeHtml(snippet)}</div>
         <div class="conv-card-bottom">
           <span class="score-pill ${scoreClass}">
-            ★ ${conv.total_score !== null ? conv.total_score.toFixed(2) : 'N/A'}
+            ★ ${conv.total_score !== null && conv.total_score !== undefined ? fmt2(conv.total_score) : (conv.last_evaluation_id ? 'итог не рассчитан' : 'не оценён')}
           </span>
           <div style="display: flex; gap: 6px;">
             ${conv.gross_error ? '<span class="alert-icon-pill" title="Грубая ошибка!">⚠️ Нарушение</span>' : ''}
@@ -318,9 +283,9 @@
     });
   }
 
-  async function selectConversation(cid) {
+  async function selectConversation(cid, quiet) {
     state.activeConvId = cid;
-    renderConversationsList();
+    if (!quiet) renderConversationsList();
 
     let conv = state.conversations.find(c => c.conversation_id === cid);
     if (conv && !conv.transcript && window.CQA_API) {
@@ -333,14 +298,55 @@
     }
 
     await ensureEvaluationLoaded(cid);
-
+    if (quiet) return;
+    renderConversationsList();
     renderTranscript();
     renderEvaluationCard();
+  }
+
+  // Evaluate the active conversation on the server: POST /api/evaluations
+  async function evaluateActive() {
+    const cid = state.activeConvId;
+    const cl = activeChecklist();
+    if (!cid || !cl) return;
+    if (!isLive()) { toast('Оценка работает только с сервером. Сейчас открыты демо-данные — подключите сервер (кнопка статуса справа сверху).'); return; }
+    if (state.activeChecklistKey === 'draft') { toast('Чек-лист — несохранённый черновик. Сначала нажмите «Сохранить и применить» во вкладке чек-листа.'); return; }
+    state.evaluating = cid;
+    renderTranscriptActions();
+    try {
+      const ev = await api().evaluate(cid, cl.id || state.activeChecklistKey);
+      state.evaluations[cid] = ev;
+      const conv = state.conversations.find(c => c.conversation_id === cid);
+      if (conv) syncConvFromEval(conv, ev);
+      if (ev.status === 'error') toast('Оценка завершилась ошибкой: ' + (ev.error || 'см. сервер'));
+    } catch (e) {
+      toast('Не удалось оценить диалог: ' + e.message);
+    } finally {
+      state.evaluating = null;
+      collectAppeals();
+      renderAll();
+    }
+  }
+
+  function renderTranscriptActions() {
+    const box = document.getElementById('transcript-actions');
+    if (!box) return;
+    const ev = state.evaluations[state.activeConvId];
+    const busy = state.evaluating === state.activeConvId;
+    const live = isLive();
+    box.innerHTML = `
+      <button class="btn-primary" id="btn-evaluate" ${busy || !live ? 'disabled' : ''}
+        title="${live ? 'POST /api/evaluations: оценить диалог по активному чек-листу' : 'Доступно только при подключённом сервере'}">
+        ${busy ? '⏳ Оцениваем…' : (ev ? '↻ Переоценить' : '▶ Оценить')}
+      </button>`;
+    const btn = document.getElementById('btn-evaluate');
+    if (btn) btn.onclick = evaluateActive;
   }
 
   // 2. TRANSCRIPT VIEW WITH REPLICA NUMBERS (#0, #1, ...)
   function renderTranscript() {
     const conv = state.conversations.find(c => c.conversation_id === state.activeConvId);
+    renderTranscriptActions();
     if (!conv) return;
 
     const titleEl = document.getElementById('active-conv-title');
@@ -350,9 +356,9 @@
 
     if (titleEl) {
       titleEl.innerHTML = `
-        <span>${conv.conversation_id}</span>
-        <span class="badge ${conv.channel === 'voice call' ? 'badge-voice' : 'badge-chat'}">${conv.channel}</span>
-        <span class="badge badge-${conv.language.toLowerCase()}">${conv.language}</span>
+        <span>${escapeHtml(conv.conversation_id)}</span>
+        <span class="badge ${conv.channel === 'voice call' ? 'badge-voice' : 'badge-chat'}">${escapeHtml(conv.channel)}</span>
+        <span class="badge badge-${String(conv.language || '').toLowerCase()}">${escapeHtml(conv.language)}</span>
       `;
     }
     if (subEl) {
@@ -386,7 +392,7 @@
 
         let speakerLabel = 'Клиент';
         if (msg.speaker === 'operator') speakerLabel = 'Оператор';
-        else if (msg.speaker === 'bot') speakerLabel = 'AIM Бот (Freedom)';
+        else if (msg.speaker === 'bot') speakerLabel = 'Бот';
         else if (msg.speaker === 'system') speakerLabel = 'Система';
 
         row.innerHTML = `
@@ -455,172 +461,175 @@
     return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
   }
 
-  // 3. EVALUATION SCORECARD
+  // 3. EVALUATION SCORECARD (everything comes from the evaluation JSON, AGENTS.md)
+  function setText(id, text) { const el = document.getElementById(id); if (el) el.textContent = text; }
+
   function renderEvaluationCard() {
     const ev = state.evaluations[state.activeConvId];
-    if (!ev) return;
-
     const totalEl = document.getElementById('total-score-display');
     const badgeEl = document.getElementById('score-status-badge');
     const grossBanner = document.getElementById('gross-error-banner');
     const grossText = document.getElementById('gross-error-text');
     const sectionsSummary = document.getElementById('sections-summary');
     const criteriaContainer = document.getElementById('criteria-container');
+    const demoTag = document.getElementById('eval-demo-tag');
 
-    if (totalEl) {
-      totalEl.textContent = ev.total !== null ? ev.total.toFixed(2) : 'N/A';
+    if (!ev) {
+      if (totalEl) totalEl.textContent = '—';
+      if (badgeEl) { badgeEl.className = 'score-label-badge badge-warning'; badgeEl.textContent = 'Не оценён'; }
+      if (grossBanner) grossBanner.style.display = 'none';
+      if (sectionsSummary) sectionsSummary.innerHTML = '';
+      setText('eval-model-tag', 'Модель: —');
+      setText('eval-cost-tag', 'Стоимость: —');
+      setText('eval-version-tag', 'Чек-лист: —');
+      if (demoTag) demoTag.style.display = 'none';
+      if (criteriaContainer) {
+        criteriaContainer.innerHTML = `<div class="empty-eval">Диалог ещё не оценён.<br>${isLive()
+          ? 'Нажмите «▶ Оценить» над транскриптом — оценку выполнит сервер.'
+          : 'Оценка доступна только при подключённом сервере.'}</div>`;
+      }
+      return;
     }
 
+    const isDemo = !isLive();
+    if (demoTag) demoTag.style.display = isDemo ? 'inline-block' : 'none';
+    const cl = checklistOf(ev);
+
+    if (totalEl) totalEl.textContent = ev.total !== null && ev.total !== undefined ? fmt2(ev.total) : '—';
+
     if (badgeEl) {
-      if (ev.gross_error) {
-        badgeEl.className = 'score-label-badge badge-violation';
-        badgeEl.textContent = 'Грубая ошибка';
-      } else if (ev.total === null) {
-        badgeEl.className = 'score-label-badge badge-warning';
-        badgeEl.textContent = 'Не оценивается';
-      } else if (ev.total >= 90) {
-        badgeEl.className = 'score-label-badge badge-excellent';
-        badgeEl.textContent = 'Отлично (90+)';
-      } else if (ev.total >= 70) {
-        badgeEl.className = 'score-label-badge badge-good';
-        badgeEl.textContent = 'Хорошо (70-89)';
-      } else {
-        badgeEl.className = 'score-label-badge badge-warning';
-        badgeEl.textContent = 'Требует внимания';
-      }
+      const lvl = scoreLevel(ev.total);
+      if (ev.status === 'error') { badgeEl.className = 'score-label-badge badge-violation'; badgeEl.textContent = 'Ошибка оценки'; }
+      else if (ev.gross_error) { badgeEl.className = 'score-label-badge badge-violation'; badgeEl.textContent = 'Грубая ошибка'; }
+      else if (lvl === 'none') { badgeEl.className = 'score-label-badge badge-warning'; badgeEl.textContent = 'Итог не рассчитан'; }
+      else if (lvl === 'excellent') { badgeEl.className = 'score-label-badge badge-excellent'; badgeEl.textContent = `≥ ${state.settings.excellent} (настройка)`; }
+      else if (lvl === 'good') { badgeEl.className = 'score-label-badge badge-good'; badgeEl.textContent = `≥ ${state.settings.good} (настройка)`; }
+      else { badgeEl.className = 'score-label-badge badge-warning'; badgeEl.textContent = `< ${state.settings.good} (настройка)`; }
+    }
+
+    // Original total (before appeals) if it differs
+    const origEl = document.getElementById('total-score-original');
+    if (origEl) {
+      const changed = ev.original_total !== undefined && ev.original_total !== null && ev.original_total !== ev.total;
+      origEl.style.display = changed ? 'inline' : 'none';
+      origEl.textContent = changed ? `исходно ${fmt2(ev.original_total)}` : '';
     }
 
     if (grossBanner) {
       if (ev.gross_error) {
         grossBanner.style.display = 'flex';
-        const grossCrit = ev.criteria.find(c => c.id === 'gross_errors' || (ev.gross_error_ids && ev.gross_error_ids.includes(c.id)));
-        if (grossText && grossCrit) {
-          grossText.textContent = grossCrit.explanation || 'Выявлено грубое нарушение правил компании!';
-        }
+        const flagCrit = (ev.criteria || []).find(c => { const d = critDef(ev, c.id); return d && d.type === 'flag' && finalAnswer(c) === 'yes'; });
+        if (grossText) grossText.textContent = (flagCrit && flagCrit.explanation) || 'Выявлена грубая ошибка';
       } else {
         grossBanner.style.display = 'none';
       }
     }
 
-    if (sectionsSummary && ev.section_scores) {
+    if (sectionsSummary) {
       sectionsSummary.innerHTML = '';
-      for (const [secName, scoreVal] of Object.entries(ev.section_scores)) {
+      for (const [secName, scoreVal] of Object.entries(ev.section_scores || {})) {
         const item = document.createElement('div');
         item.className = 'section-bar-item';
         const pct = scoreVal !== null ? scoreVal : 0;
         item.innerHTML = `
           <div class="section-bar-label">
             <span>${escapeHtml(secName)}</span>
-            <span><strong>${scoreVal !== null ? scoreVal.toFixed(1) + '%' : 'N/A'}</strong></span>
+            <span><strong>${scoreVal !== null ? fmt2(scoreVal) + '%' : 'N/A'}</strong></span>
           </div>
-          <div class="bar-track">
-            <div class="bar-fill" style="width: ${pct}%;"></div>
-          </div>
-        `;
+          <div class="bar-track"><div class="bar-fill" style="width: ${pct}%;"></div></div>`;
         sectionsSummary.appendChild(item);
       }
     }
 
-    if (criteriaContainer && ev.criteria) {
-      criteriaContainer.innerHTML = '';
-      ev.criteria.forEach((crit) => {
-        const card = document.createElement('div');
-        card.className = 'criterion-card';
+    // Model, cost, checklist version: from the evaluation JSON only
+    setText('eval-model-tag', 'Модель: ' + (ev.model || '—'));
+    setText('eval-cost-tag', 'Стоимость: ' + (ev.cost_usd !== null && ev.cost_usd !== undefined ? '$' + Number(ev.cost_usd).toFixed(4) : '—'));
+    setText('eval-version-tag', `Чек-лист: ${cl && cl.name ? cl.name + ' ' : ''}v${ev.checklist_version !== undefined ? ev.checklist_version : '—'}`);
 
-        let ansClass = 'ans-yes';
-        let ansText = String(crit.answer).toUpperCase();
-        if (crit.answer === 'no') { ansClass = 'ans-no'; ansText = 'НЕТ'; }
-        else if (crit.answer === 'yes') { ansClass = 'ans-yes'; ansText = 'ДА'; }
-        else if (crit.answer === 'na' || !crit.applicable) { ansClass = 'ans-na'; ansText = 'N/A'; }
-        else if (typeof crit.answer === 'number') { ansClass = 'ans-scale'; ansText = `${crit.answer} б.`; }
-
-        if (crit.weight === 0) {
-          if (crit.answer === 'yes') { ansClass = 'ans-flag-active'; ansText = '⚠️ НАРУШЕНИЕ'; }
-          else { ansClass = 'ans-flag-clear'; ansText = 'ЧИСТО'; }
-        }
-
-        let evidenceHtml = '';
-        if (crit.evidence && crit.evidence.length > 0) {
-          evidenceHtml = crit.evidence.map(evItem => `
-            <div class="evidence-row">
-              <div class="evidence-quote">«${escapeHtml(evItem.quote)}»</div>
-              <button class="evidence-link-btn" onclick="app.scrollToReplica(${evItem.message_index})">
-                <span>📍 Перейти к реплике #${evItem.message_index} ↗</span>
-              </button>
-            </div>
-          `).join('');
-        }
-
-        let naHtml = '';
-        if (crit.answer === 'na' && crit.na_reason) {
-          naHtml = `<div class="na-reason-box">ℹ️ ${escapeHtml(crit.na_reason)}</div>`;
-        }
-
-        let rulesHtml = '';
-        if (crit.rules) {
-          rulesHtml = `<div class="rules-box"><strong>Правило:</strong> ${escapeHtml(crit.rules)}</div>`;
-        }
-
-        let appealHtml = '';
-        if (crit.appeal) {
-          appealHtml = `
-            <div style="font-size: 11px; background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: 6px 8px; width: 100%;">
-              <div style="display: flex; justify-content: space-between; align-items: center;">
-                <span class="appeal-status-badge">⚖️ ${crit.appeal.status === 'open' ? 'На апелляции' : 'Рассмотрено'}</span>
-                ${crit.appeal.status === 'open' ? `
-                  <button class="btn-primary" style="padding: 2px 8px; font-size: 11px;" onclick="app.openReviewModal('${state.activeConvId}', '${crit.id}')">
-                    Рассмотреть (QC)
-                  </button>
-                ` : ''}
-              </div>
-              <div style="margin-top: 4px; color: #92400e;"><strong>Оператор:</strong> ${escapeHtml(crit.appeal.comment)}</div>
-              ${crit.appeal.decision ? `
-                <div style="margin-top: 4px; color: #065f46; border-top: 1px dashed #d1fae5; padding-top: 4px;">
-                  <strong>Решение QC:</strong> ${crit.appeal.decision === 'change' ? 'Оценка изменена' : 'Подтверждено ИИ'}. Причина: ${escapeHtml(crit.appeal.reason || '—')}
-                </div>
-              ` : ''}
-            </div>
-          `;
-        } else {
-          appealHtml = `
-            <button class="appeal-btn" onclick="app.openAppealModal('${crit.id}', '${crit.title}', '${ansText}')">
-              <span>⚖️ Оспорить оценку</span>
-            </button>
-          `;
-        }
-
-        card.innerHTML = `
-          <div class="criterion-header">
-            <div class="criterion-title-wrap">
-              <span class="criterion-section-tag">${escapeHtml(crit.section || '')}</span>
-              <span class="criterion-title">${crit.title}</span>
-            </div>
-            <div class="criterion-badges-wrap">
-              <span class="ans-badge ${ansClass}">${ansText}</span>
-              <span class="points-pill">+${crit.points.toFixed(2)} б.</span>
-            </div>
-          </div>
-
-          <div class="weights-row">
-            <span>Базовый вес: <strong>${crit.weight}</strong></span>
-            <span class="eff-weight-highlight">Эффективный вес: <strong>${crit.effective_weight.toFixed(2)}%</strong></span>
-          </div>
-
-          <div class="criterion-explanation">
-            ${escapeHtml(crit.explanation || '—')}
-          </div>
-
-          ${rulesHtml}
-          ${naHtml}
-          ${evidenceHtml}
-
-          <div class="criterion-footer">
-            ${appealHtml}
-          </div>
-        `;
-        criteriaContainer.appendChild(card);
-      });
+    if (!criteriaContainer) return;
+    criteriaContainer.innerHTML = '';
+    if (ev.status === 'error') {
+      criteriaContainer.innerHTML = `<div class="empty-eval">Сервер не смог оценить диалог: ${escapeHtml(ev.error || ev.message || 'неизвестная ошибка')}.<br>Нажмите «↻ Переоценить».</div>`;
+      return;
     }
+    const transcript = (state.conversations.find(c => c.conversation_id === state.activeConvId) || {}).transcript || [];
+
+    (ev.criteria || []).forEach((crit) => {
+      const def = critDef(ev, crit.id);
+      const fin = finalAnswer(crit);
+      const orig = crit.original_answer !== undefined && crit.original_answer !== null ? crit.original_answer : crit.answer;
+      const view = answerView(def, crit, fin);
+      const origView = answerView(def, crit, orig);
+      const isFlag = def ? def.type === 'flag' : crit.weight === 0;
+      const card = document.createElement('div');
+      card.className = 'criterion-card';
+
+      const evidenceHtml = (crit.evidence || []).map(e => `
+          <div class="evidence-row">
+            <div class="evidence-quote">«${escapeHtml(e.quote || (transcript[e.message_index] || {}).text || '')}»</div>
+            <button class="evidence-link-btn" onclick="app.scrollToReplica(${Number(e.message_index)})">
+              <span>📍 Перейти к реплике #${Number(e.message_index)} ↗</span>
+            </button>
+          </div>`).join('');
+
+      const rangeHtml = Array.isArray(crit.checked_range) && crit.checked_range.length === 2 ? `
+          <div class="evidence-row">
+            <div class="evidence-quote">Проверен участок #${Number(crit.checked_range[0])}–#${Number(crit.checked_range[1])}: здесь ожидалось действие</div>
+            <button class="evidence-link-btn" onclick="app.scrollToReplica(${Number(crit.checked_range[0])}, ${Number(crit.checked_range[1])})">
+              <span>📍 Показать участок ↗</span>
+            </button>
+          </div>` : '';
+
+      const naHtml = fin === 'na' ? `<div class="na-reason-box">ℹ️ Почему N/A: ${escapeHtml(crit.na_reason || (def && def.na_condition) || '—')}</div>` : '';
+      const rules = (def && def.rules) || crit.rules;
+      const rulesHtml = rules ? `<div class="rules-box"><strong>Правило:</strong> ${escapeHtml(rules)}</div>` : '';
+
+      let appealHtml;
+      if (crit.appeal) {
+        const open = crit.appeal.status === 'open';
+        appealHtml = `
+          <div style="font-size: 11px; background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: 6px 8px; width: 100%;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span class="appeal-status-badge">⚖️ ${open ? 'На апелляции' : 'Рассмотрено'}</span>
+              ${open ? `<button class="btn-primary" style="padding: 2px 8px; font-size: 11px;" onclick="app.openReviewModal('${escapeHtml(state.activeConvId)}', '${escapeHtml(crit.id)}')">Рассмотреть</button>` : ''}
+            </div>
+            <div style="margin-top: 4px; color: #92400e;"><strong>Апелляция:</strong> ${escapeHtml(crit.appeal.comment)}</div>
+            ${crit.appeal.decision ? `
+              <div style="margin-top: 4px; color: #065f46; border-top: 1px dashed #d1fae5; padding-top: 4px;">
+                <strong>Решение:</strong> ${crit.appeal.decision === 'change' ? 'оценка изменена' : 'оценка подтверждена'}. Причина: ${escapeHtml(crit.appeal.reason || '—')}
+              </div>` : ''}
+          </div>`;
+      } else {
+        appealHtml = `<button class="appeal-btn" onclick="app.openAppealModal('${escapeHtml(crit.id)}')"><span>⚖️ Оспорить оценку</span></button>`;
+      }
+
+      const pointsHtml = isFlag ? '<span class="points-pill">без баллов</span>'
+        : crit.applicable ? `<span class="points-pill">${fmt2(crit.points)} б.</span>` : '<span class="points-pill">—</span>';
+      const weightsHtml = isFlag ? '<span>Флаг: на итог не влияет, отмечается отдельно</span>'
+        : `<span>Вес: <strong>${crit.weight}</strong></span>
+           <span class="eff-weight-highlight">${crit.applicable ? `После перераспределения: <strong>${fmt2(crit.effective_weight)}</strong>` : 'N/A: вес перераспределён'}</span>`;
+
+      card.innerHTML = `
+        <div class="criterion-header">
+          <div class="criterion-title-wrap">
+            <span class="criterion-section-tag">${escapeHtml((def && def.section) || crit.section || '')}</span>
+            <span class="criterion-title">${escapeHtml(crit.title)}</span>
+          </div>
+          <div class="criterion-badges-wrap">
+            ${String(orig) !== String(fin) ? `<span class="ans-badge ${origView.cls}" style="text-decoration: line-through; opacity: .55;" title="Исходная оценка">${origView.text}</span>` : ''}
+            <span class="ans-badge ${view.cls}">${view.text}</span>
+            ${pointsHtml}
+          </div>
+        </div>
+        <div class="weights-row">${weightsHtml}</div>
+        <div class="criterion-explanation">${escapeHtml(crit.explanation || '—')}</div>
+        ${rulesHtml}
+        ${naHtml}
+        ${evidenceHtml}
+        ${rangeHtml}
+        <div class="criterion-footer">${appealHtml}</div>`;
+      criteriaContainer.appendChild(card);
+    });
   }
 
   // 4. APPEALS VIEW TABLE
@@ -638,16 +647,16 @@
       const tr = document.createElement('tr');
       const isPending = item.appeal.status === 'open';
       tr.innerHTML = `
-        <td><a href="javascript:void(0)" onclick="app.selectConversationAndTab('${item.conversation_id}')" style="font-weight: 700; color: var(--primary); text-decoration: none;">${item.conversation_id}</a></td>
+        <td><a href="javascript:void(0)" onclick="app.selectConversationAndTab('${escapeHtml(item.conversation_id)}')" style="font-weight: 700; color: var(--primary); text-decoration: none;">${escapeHtml(item.conversation_id)}</a></td>
         <td><strong>${escapeHtml(item.criterion_title)}</strong></td>
-        <td><span class="ans-badge ans-no">${String(item.answer).toUpperCase()}</span></td>
+        <td><span class="ans-badge ${item.view.cls}">${item.view.text}</span></td>
         <td style="max-width: 320px;">${escapeHtml(item.appeal.comment)}</td>
         <td>
           <span class="badge ${isPending ? 'score-fair' : 'score-perfect'}">${isPending ? 'На рассмотрении' : 'Завершено'}</span>
         </td>
         <td>
           ${isPending ? `
-            <button class="btn-primary" style="padding: 4px 10px; font-size: 11px;" onclick="app.openReviewModal('${item.conversation_id}', '${item.criterion_id}')">
+            <button class="btn-primary" style="padding: 4px 10px; font-size: 11px;" onclick="app.openReviewModal('${escapeHtml(item.conversation_id)}', '${escapeHtml(item.criterion_id)}')">
               Принять решение
             </button>
           ` : `
@@ -666,13 +675,15 @@
     const channelSelect = document.getElementById('checklist-channel-select');
     if (!tbody) return;
 
-    const checklist = state.checklists[state.activeChecklistKey] || state.checklists['default'];
-    if (!checklist || !checklist.criteria) return;
+    const checklist = activeChecklist();
+    if (!checklist || !checklist.criteria) { tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:24px;color:var(--text-muted)">Чек-листы не загружены</td></tr>'; return; }
 
     if (channelSelect) {
       channelSelect.value = checklist.applies_to || 'agent chat';
       channelSelect.onchange = (e) => {
-        checklist.applies_to = e.target.value;
+        editableChecklist().applies_to = e.target.value;
+        renderChecklistPicker();
+        renderChecklistTable();
       };
     }
 
@@ -698,8 +709,8 @@
       tr.innerHTML = `
         <td>${idx + 1}</td>
         <td><span class="badge badge-chat">${escapeHtml(crit.section || '—')}</span></td>
-        <td><strong>${escapeHtml(crit.title)}</strong></td>
-        <td>${typeLabel}</td>
+        <td><strong>${escapeHtml(crit.title)}</strong>${crit.instruction ? `<div style="font-size:11px;color:var(--text-muted);margin-top:3px">${escapeHtml(crit.instruction)}</div>` : ''}</td>
+        <td>${typeLabel}${crit.allow_na && crit.na_condition ? `<div style="font-size:11px;color:var(--text-muted);margin-top:3px">${escapeHtml(crit.na_condition)}</div>` : ''}</td>
         <td><strong>${crit.weight}</strong></td>
         <td>${crit.allow_na ? '<span style="color: var(--success); font-weight: 700;">✓ Да</span>' : '<span style="color: var(--text-muted);">— Нет</span>'}</td>
         <td style="max-width: 280px; font-size: 12px; color: #334155;">
@@ -707,8 +718,8 @@
         </td>
         <td>
           <div style="display: flex; gap: 6px;">
-            <button class="chip-btn" onclick="app.openEditCriterionModal('${crit.id}')">Редактировать</button>
-            <button class="chip-btn" style="color: var(--danger);" onclick="app.deleteCriterion('${crit.id}')">Удалить</button>
+            <button class="chip-btn" onclick="app.openEditCriterionModal('${escapeHtml(crit.id)}')">Редактировать</button>
+            <button class="chip-btn" style="color: var(--danger);" onclick="app.deleteCriterion('${escapeHtml(crit.id)}')">Удалить</button>
           </div>
         </td>
       `;
@@ -721,7 +732,7 @@
     const totalConvs = state.conversations.length;
     if (totalConvs === 0) return;
 
-    const validScores = state.conversations.filter(c => c.total_score !== null).map(c => c.total_score);
+    const validScores = state.conversations.filter(c => c.total_score !== null && c.total_score !== undefined).map(c => c.total_score);
     const avgScore = validScores.length > 0 ? (validScores.reduce((a, b) => a + b, 0) / validScores.length) : 0;
     const grossErrors = state.conversations.filter(c => c.gross_error).length;
     const appealsCount = state.appeals.length;
@@ -731,30 +742,36 @@
     const grossEl = document.getElementById('kpi-gross-errors');
     const appealsEl = document.getElementById('kpi-appeals-count');
 
-    if (avgEl) avgEl.textContent = avgScore.toFixed(1) + '%';
+    if (avgEl) avgEl.textContent = validScores.length ? avgScore.toFixed(2) : '—';
     if (totalEl) totalEl.textContent = totalConvs;
     if (grossEl) grossEl.textContent = grossErrors;
     if (appealsEl) appealsEl.textContent = appealsCount;
 
-    const excellent = state.conversations.filter(c => c.total_score >= 90).length;
-    const good = state.conversations.filter(c => c.total_score >= 70 && c.total_score < 90).length;
-    const fair = state.conversations.filter(c => c.total_score !== null && c.total_score < 70).length;
+    const st = state.settings;
+    const scoredConvs = state.conversations.filter(c => c.total_score !== null && c.total_score !== undefined);
+    const excellent = scoredConvs.filter(c => c.total_score >= st.excellent).length;
+    const good = scoredConvs.filter(c => c.total_score >= st.good && c.total_score < st.excellent).length;
+    const fair = scoredConvs.filter(c => c.total_score < st.good).length;
+    const targetEl = document.getElementById('kpi-target-sub');
+    if (targetEl) targetEl.textContent = `Целевой уровень (настройка): ≥ ${st.target}%`;
+    const totalSub = document.getElementById('kpi-total-sub');
+    if (totalSub) totalSub.textContent = `оценено ${scoredConvs.length} · чатов ${state.conversations.filter(c => c.channel === 'agent chat').length} · звонков ${state.conversations.filter(c => c.channel === 'voice call').length}`;
 
     const distribContainer = document.getElementById('distrib-bars-container');
     if (distribContainer) {
       distribContainer.innerHTML = `
         <div class="distrib-bar-row">
-          <span class="distrib-bar-label">Отлично (≥ 90%):</span>
+          <span class="distrib-bar-label">≥ ${st.excellent} (настройка):</span>
           <div class="distrib-bar-track"><div class="distrib-bar-fill" style="width: ${(excellent / totalConvs) * 100}%; background: var(--success);"></div></div>
           <span class="distrib-bar-val">${excellent} (${Math.round((excellent / totalConvs) * 100)}%)</span>
         </div>
         <div class="distrib-bar-row">
-          <span class="distrib-bar-label">Хорошо (70–89%):</span>
+          <span class="distrib-bar-label">${st.good}–${st.excellent} (настройка):</span>
           <div class="distrib-bar-track"><div class="distrib-bar-fill" style="width: ${(good / totalConvs) * 100}%; background: var(--info);"></div></div>
           <span class="distrib-bar-val">${good} (${Math.round((good / totalConvs) * 100)}%)</span>
         </div>
         <div class="distrib-bar-row">
-          <span class="distrib-bar-label">Требует внимания (&lt; 70%):</span>
+          <span class="distrib-bar-label">&lt; ${st.good} (настройка):</span>
           <div class="distrib-bar-track"><div class="distrib-bar-fill" style="width: ${(fair / totalConvs) * 100}%; background: var(--warning);"></div></div>
           <span class="distrib-bar-val">${fair} (${Math.round((fair / totalConvs) * 100)}%)</span>
         </div>
@@ -766,9 +783,19 @@
       `;
     }
 
+    const grid = document.getElementById('lang-channel-grid');
+    if (grid) {
+      const n = totalConvs;
+      const row = (label, k) => `<div class="stat-pill-row"><span>${label}</span><strong>${k} (${n ? Math.round(k / n * 100) : 0}%)</strong></div>`;
+      const langs = [...new Set(state.conversations.map(c => c.language))];
+      grid.innerHTML = row('💬 Чаты (agent chat):', state.conversations.filter(c => c.channel === 'agent chat').length)
+        + row('📞 Звонки (voice call):', state.conversations.filter(c => c.channel === 'voice call').length)
+        + langs.map(l => row(`${escapeHtml(l)}:`, state.conversations.filter(c => c.language === l).length)).join('');
+    }
+
     const critTableBody = document.getElementById('analytics-criteria-body');
     if (critTableBody) {
-      const checklist = state.checklists[state.activeChecklistKey] || state.checklists['default'];
+      const checklist = activeChecklist();
       if (checklist && checklist.criteria) {
         critTableBody.innerHTML = '';
         checklist.criteria.forEach(crit => {
@@ -779,36 +806,40 @@
             const ev = state.evaluations[cid];
             const cItem = ev.criteria && ev.criteria.find(c => c.id === crit.id);
             if (cItem) {
+              const a = finalAnswer(cItem);
               if (crit.type === 'flag') {
                 applicableCount++;
-                if (cItem.answer === 'no') passedCount++;
-              } else if (cItem.applicable) {
+                if (a === 'no') passedCount++;
+              } else if (a !== 'na') {
                 applicableCount++;
-                if (crit.type === 'yes_no' && cItem.answer === 'yes') passedCount++;
-                else if (crit.type === 'scale') {
-                  const maxStep = Math.max(...(crit.steps || [20]));
-                  passedCount += Number(cItem.answer || 0) / maxStep;
+                if (crit.type === 'yes_no' && a === 'yes') passedCount++;
+                else if (crit.type === 'scale' && crit.steps && crit.steps.length) {
+                  const maxStep = Math.max(...crit.steps.map(Number));
+                  if (maxStep > 0) passedCount += Number(a || 0) / maxStep;
                 }
               }
             }
           }
 
-          const complianceRate = applicableCount > 0 ? Math.round((passedCount / applicableCount) * 100) : 100;
-          let statusBadge = '<span class="badge score-perfect">Норматив выполнен</span>';
-          if (complianceRate < 75) statusBadge = '<span class="badge score-poor">Критическая зона</span>';
-          else if (complianceRate < 85) statusBadge = '<span class="badge score-fair">Требует коучинга</span>';
+          const complianceRate = applicableCount > 0 ? Math.round((passedCount / applicableCount) * 100) : null;
+          let statusBadge = '<span class="badge score-fair">нет данных</span>';
+          if (complianceRate !== null) {
+            statusBadge = complianceRate >= st.target ? `<span class="badge score-perfect">≥ ${st.target}% (настройка)</span>`
+              : complianceRate >= st.good ? `<span class="badge score-fair">${st.good}–${st.target}% (настройка)</span>`
+              : `<span class="badge score-poor">&lt; ${st.good}% (настройка)</span>`;
+          }
 
           const tr = document.createElement('tr');
           tr.innerHTML = `
             <td><strong>${escapeHtml(crit.title)}</strong></td>
             <td><span class="badge badge-chat">${escapeHtml(crit.section || '—')}</span></td>
-            <td><strong>${crit.weight}</strong></td>
+            <td><strong>${crit.type === 'flag' ? 'флаг' : crit.weight}</strong></td>
             <td>
               <div style="display: flex; align-items: center; gap: 8px;">
                 <div style="width: 80px; height: 6px; background: #e2e8f0; border-radius: 3px; overflow: hidden;">
-                  <div style="width: ${complianceRate}%; height: 100%; background: ${complianceRate >= 85 ? 'var(--primary)' : (complianceRate >= 75 ? 'var(--warning)' : 'var(--danger)')};"></div>
+                  <div style="width: ${complianceRate || 0}%; height: 100%; background: ${complianceRate === null ? '#cbd5e1' : complianceRate >= st.target ? 'var(--primary)' : (complianceRate >= st.good ? 'var(--warning)' : 'var(--danger)')};"></div>
                 </div>
-                <strong>${complianceRate}%</strong>
+                <strong>${complianceRate === null ? '—' : complianceRate + '%'}</strong>
               </div>
             </td>
             <td>${statusBadge}</td>
@@ -820,302 +851,312 @@
   }
 
   // --- ACTIONS & MODALS ---
-  function openAppealModal(critId, critTitle, currentScore) {
-    const modal = document.getElementById('appeal-modal');
-    document.getElementById('appeal-modal-criterion').value = critTitle;
+  // Appeal: POST /api/evaluations/{id}/appeals {criterion_id, comment}
+  function openAppealModal(critId) {
+    const ev = state.evaluations[state.activeConvId];
+    if (!ev) return;
+    const crit = (ev.criteria || []).find(c => c.id === critId);
+    if (!crit) return;
+    if (!isLive()) { toast('Апелляции сохраняются на сервере. Сейчас открыты демо-данные — подключите сервер.'); return; }
+    document.getElementById('appeal-modal-criterion').value = crit.title;
     document.getElementById('appeal-modal-criterion-id').value = critId;
-    document.getElementById('appeal-modal-current-score').value = currentScore;
+    document.getElementById('appeal-modal-current-score').value = answerView(critDef(ev, critId), crit).text;
     document.getElementById('appeal-modal-comment').value = '';
+    const modal = document.getElementById('appeal-modal');
     if (modal) modal.classList.add('active');
   }
 
-  function submitAppeal() {
+  async function submitAppeal() {
     const critId = document.getElementById('appeal-modal-criterion-id').value;
     const comment = document.getElementById('appeal-modal-comment').value.trim();
-
-    if (!comment) {
-      alert('Пожалуйста, укажите комментарий с аргументацией!');
-      return;
-    }
-
+    if (!comment) { toast('Укажите комментарий с аргументацией'); return; }
     const ev = state.evaluations[state.activeConvId];
-    if (ev) {
-      const crit = ev.criteria.find(c => c.id === critId);
-      if (crit) {
-        crit.appeal = {
-          comment: comment,
-          status: 'open',
-          created_at: new Date().toISOString()
-        };
-      }
+    if (!ev) return;
+    try {
+      await api().createAppeal(ev.id, critId, comment);
+      closeModal('appeal-modal');
+      await refreshEvaluation(state.activeConvId, ev.id);
+    } catch (e) {
+      toast('Апелляция не отправлена: ' + e.message);
     }
-
-    const conv = state.conversations.find(c => c.conversation_id === state.activeConvId);
-    if (conv) conv.has_appeal = true;
-
-    closeModal('appeal-modal');
-    collectAppeals();
-    renderEvaluationCard();
-    renderConversationsList();
-    renderAppealsTable();
   }
 
+  async function refreshEvaluation(cid, evId) {
+    const fresh = await api().getEvaluation(evId);
+    if (fresh) {
+      state.evaluations[cid] = fresh;
+      const conv = state.conversations.find(c => c.conversation_id === cid);
+      if (conv) syncConvFromEval(conv, fresh);
+    }
+    collectAppeals();
+    renderAll();
+  }
+
+  // Review decision: POST /api/appeals/{id}/decision {decision, new_answer?, reason}
   function openReviewModal(convId, critId) {
     const ev = state.evaluations[convId];
     if (!ev) return;
-    const crit = ev.criteria.find(c => c.id === critId);
+    const crit = (ev.criteria || []).find(c => c.id === critId);
     if (!crit || !crit.appeal) return;
+    const def = critDef(ev, critId) || {};
+    state.review = { convId, critId };
 
-    document.getElementById('review-modal-target').value = `${convId} — ${crit.title}`;
+    document.getElementById('review-modal-target').value = `${convId} — ${crit.title} (сейчас: ${answerView(def, crit).text})`;
     document.getElementById('review-modal-conv-id').value = convId;
     document.getElementById('review-modal-criterion-id').value = critId;
     document.getElementById('review-modal-operator-comment').textContent = crit.appeal.comment;
     document.getElementById('review-modal-reason').value = '';
 
+    // New answer options come from the criterion type in the checklist
+    const sel = document.getElementById('review-modal-new-answer');
+    if (sel) {
+      let opts = [];
+      if (def.type === 'scale') opts = (def.steps || []).map(v => [String(v), `${v} из ${Math.max(...def.steps)}${def.step_descriptions && def.step_descriptions[String(v)] ? ' — ' + def.step_descriptions[String(v)] : ''}`]);
+      else if (def.type === 'flag') opts = [['yes', 'Нарушение есть'], ['no', 'Нарушения нет']];
+      else opts = [['yes', 'Да'], ['no', 'Нет']];
+      if (def.allow_na) opts.push(['na', 'N/A']);
+      const cur = String(finalAnswer(crit));
+      sel.innerHTML = opts.filter(([v]) => v !== cur).map(([v, l]) => `<option value="${escapeHtml(v)}">${escapeHtml(l)}</option>`).join('');
+    }
+    const decSel = document.getElementById('review-modal-decision-type');
+    const grp = document.getElementById('review-new-answer-group');
+    if (decSel && grp) {
+      decSel.value = 'confirm';
+      grp.style.display = 'none';
+      decSel.onchange = () => { grp.style.display = decSel.value === 'change' ? 'block' : 'none'; };
+    }
     const modal = document.getElementById('review-modal');
     if (modal) modal.classList.add('active');
   }
 
-  function applyReviewDecision() {
+  async function findAppealId(ev, critId) {
+    const crit = (ev.criteria || []).find(c => c.id === critId);
+    if (crit && crit.appeal && (crit.appeal.id || crit.appeal.appeal_id)) return crit.appeal.id || crit.appeal.appeal_id;
+    const open = await api().getAppeals('open');
+    const list = Array.isArray(open) ? open : (open && open.appeals) || [];
+    const hit = list.find(a => (a.evaluation_id === ev.id || a.conversation_id === ev.conversation_id) && a.criterion_id === critId);
+    if (!hit) throw new Error('не найден id апелляции на сервере');
+    return hit.id;
+  }
+
+  async function applyReviewDecision() {
     const convId = document.getElementById('review-modal-conv-id').value;
     const critId = document.getElementById('review-modal-criterion-id').value;
     const decisionType = document.getElementById('review-modal-decision-type').value;
-    const newAnswer = document.getElementById('review-modal-new-answer').value;
+    let newAnswer = document.getElementById('review-modal-new-answer').value;
     const reason = document.getElementById('review-modal-reason').value.trim();
-
-    if (!reason) {
-      alert('Пожалуйста, укажите причину решения проверяющего!');
-      return;
-    }
+    if (!reason) { toast('Укажите причину решения'); return; }
+    if (!isLive()) { toast('Решение по апелляции сохраняет сервер. Сейчас открыты демо-данные.'); return; }
 
     const ev = state.evaluations[convId];
     if (!ev) return;
-    const crit = ev.criteria.find(c => c.id === critId);
-    if (!crit) return;
-
-    crit.appeal.status = 'closed';
-    crit.appeal.decision = decisionType;
-    crit.appeal.reason = reason;
-
-    if (decisionType === 'change') {
-      crit.final_answer = newAnswer;
-      crit.answer = newAnswer;
-
-      const checklist = state.checklists[state.activeChecklistKey] || state.checklists['default'];
-      const answersMap = {};
-      ev.criteria.forEach(c => answersMap[c.id] = c.answer);
-      answersMap[critId] = newAnswer;
-
-      const scored = computeScore(checklist, answersMap);
-      ev.total = scored.total;
-      ev.section_scores = scored.section_scores;
-
-      scored.criteria.forEach(scCrit => {
-        const target = ev.criteria.find(c => c.id === scCrit.id);
-        if (target) {
-          target.points = scCrit.points;
-          target.effective_weight = scCrit.effective_weight;
-          target.applicable = scCrit.applicable;
-        }
-      });
-
-      const conv = state.conversations.find(c => c.conversation_id === convId);
-      if (conv) conv.total_score = scored.total;
+    const def = critDef(ev, critId) || {};
+    if (decisionType === 'change' && def.type === 'scale' && newAnswer !== 'na') newAnswer = Number(newAnswer);
+    try {
+      const appealId = await findAppealId(ev, critId);
+      await api().decideAppeal(appealId, decisionType, decisionType === 'change' ? newAnswer : undefined, reason);
+      closeModal('review-modal');
+      await refreshEvaluation(convId, ev.id); // new total comes from the server (scoring.py)
+    } catch (e) {
+      toast('Решение не сохранено: ' + e.message);
     }
-
-    closeModal('review-modal');
-    collectAppeals();
-    renderAll();
   }
 
-  // Checklist Editor Actions
-  function openEditCriterionModal(critId) {
-    const checklist = state.checklists[state.activeChecklistKey] || state.checklists['default'];
-    const crit = checklist.criteria.find(c => c.id === critId);
-    if (!crit) return;
+  // --- CHECKLIST EDITOR ---
+  // Edits go to a local draft; "Сохранить и применить" sends it to the server (POST /api/checklists),
+  // activates it and re-evaluates conversations (POST /api/evaluations/batch).
+  function editableChecklist() {
+    if (state.activeChecklistKey === 'draft' && state.checklists['draft']) return state.checklists['draft'];
+    const base = activeChecklist();
+    const draft = JSON.parse(JSON.stringify(base || { name: 'Новый чек-лист', version: 0, rounding: 2, criteria: [] }));
+    draft.based_on = base && base.id ? base.id : state.activeChecklistKey;
+    delete draft.id;
+    draft.version = (Number(draft.version) || 0) + 1;
+    state.checklists['draft'] = draft;
+    state.activeChecklistKey = 'draft';
+    saveDraft();
+    renderChecklistPicker();
+    return draft;
+  }
+  function saveDraft() {
+    try { localStorage.setItem('cqa_checklist_draft', JSON.stringify(state.checklists['draft'])); } catch (e) { /* storage off */ }
+  }
+  function sectionsOf(cl) {
+    return [...new Set((cl && cl.criteria || []).map(c => c.section).filter(Boolean))];
+  }
+  function fillSectionOptions(current) {
+    const sel = document.getElementById('crit-edit-section');
+    const list = document.getElementById('crit-edit-section-list');
+    const secs = sectionsOf(activeChecklist());
+    if (list) list.innerHTML = secs.map(x => `<option value="${escapeHtml(x)}"></option>`).join('');
+    if (sel) sel.value = current || '';
+  }
+  function toggleTypeFields() {
+    const type = document.getElementById('crit-edit-type').value;
+    const steps = document.getElementById('crit-edit-steps-group');
+    const w = document.getElementById('crit-edit-weight-group');
+    if (steps) steps.style.display = type === 'scale' ? 'block' : 'none';
+    if (w) w.style.display = type === 'flag' ? 'none' : 'block';
+    const naChk = document.getElementById('crit-edit-allow-na');
+    const naGrp = document.getElementById('crit-edit-na-group');
+    if (naGrp && naChk) naGrp.style.display = naChk.checked ? 'block' : 'none';
+  }
 
-    document.getElementById('criterion-modal-title').textContent = 'Редактирование критерия';
-    document.getElementById('crit-edit-id').value = crit.id;
-    document.getElementById('crit-edit-id').readOnly = true;
-    document.getElementById('crit-edit-title').value = crit.title;
-    document.getElementById('crit-edit-section').value = crit.section || 'Начало и понимание запроса';
-    document.getElementById('crit-edit-type').value = crit.type;
-    document.getElementById('crit-edit-weight').value = crit.weight;
+  function fillCriterionModal(crit, isNew) {
+    document.getElementById('criterion-modal-title').textContent = isNew ? 'Новый критерий' : 'Редактирование критерия';
+    document.getElementById('crit-edit-id').value = crit.id || '';
+    document.getElementById('crit-edit-id').readOnly = !isNew;
+    document.getElementById('crit-edit-title').value = crit.title || '';
+    fillSectionOptions(crit.section);
+    document.getElementById('crit-edit-type').value = crit.type || 'yes_no';
+    document.getElementById('crit-edit-weight').value = crit.weight !== undefined ? crit.weight : '';
     document.getElementById('crit-edit-allow-na').checked = !!crit.allow_na;
+    document.getElementById('crit-edit-na-condition').value = crit.na_condition || '';
+    document.getElementById('crit-edit-steps').value = (crit.steps || []).join(', ');
     document.getElementById('crit-edit-instruction').value = crit.instruction || '';
     document.getElementById('crit-edit-rules').value = crit.rules || '';
-
+    toggleTypeFields();
     const modal = document.getElementById('criterion-modal');
     if (modal) modal.classList.add('active');
+  }
+
+  function openEditCriterionModal(critId) {
+    const crit = (activeChecklist().criteria || []).find(c => c.id === critId);
+    if (crit) fillCriterionModal(crit, false);
   }
 
   function openAddCriterionModal() {
-    document.getElementById('criterion-modal-title').textContent = 'Добавление нового критерия';
-    document.getElementById('crit-edit-id').value = 'criterion_' + (Date.now() % 1000);
-    document.getElementById('crit-edit-id').readOnly = false;
-    document.getElementById('crit-edit-title').value = '';
-    document.getElementById('crit-edit-section').value = 'Начало и понимание запроса';
-    document.getElementById('crit-edit-type').value = 'yes_no';
-    document.getElementById('crit-edit-weight').value = '10';
-    document.getElementById('crit-edit-allow-na').checked = true;
-    document.getElementById('crit-edit-instruction').value = '';
-    document.getElementById('crit-edit-rules').value = '';
-
-    const modal = document.getElementById('criterion-modal');
-    if (modal) modal.classList.add('active');
+    fillCriterionModal({ id: '', type: 'yes_no', allow_na: false, section: sectionsOf(activeChecklist())[0] || '' }, true);
   }
 
   function saveCriterion() {
     const id = document.getElementById('crit-edit-id').value.trim();
     const title = document.getElementById('crit-edit-title').value.trim();
-    const section = document.getElementById('crit-edit-section').value;
+    const section = document.getElementById('crit-edit-section').value.trim();
     const type = document.getElementById('crit-edit-type').value;
-    const weight = Number(document.getElementById('crit-edit-weight').value);
+    const weight = type === 'flag' ? 0 : Number(document.getElementById('crit-edit-weight').value);
     const allowNa = document.getElementById('crit-edit-allow-na').checked;
+    const naCondition = document.getElementById('crit-edit-na-condition').value.trim();
+    const steps = document.getElementById('crit-edit-steps').value.split(/[,;\s]+/).filter(Boolean).map(Number);
     const instruction = document.getElementById('crit-edit-instruction').value.trim();
     const rules = document.getElementById('crit-edit-rules').value.trim();
 
-    if (!id || !title) {
-      alert('Пожалуйста, укажите ID и название критерия!');
-      return;
-    }
+    if (!/^[a-z0-9_]+$/i.test(id)) { toast('ID: латиница, цифры и _ (например, closing)'); return; }
+    if (!title) { toast('Укажите название критерия'); return; }
+    if (!instruction) { toast('Укажите инструкцию по оценке — по ней оценивает модель'); return; }
+    if (type !== 'flag' && !(weight >= 0)) { toast('Вес должен быть числом ≥ 0'); return; }
+    if (type === 'scale' && (steps.length < 2 || steps.some(isNaN) || steps.some(v => v < 0) || Math.max(...steps) <= 0)) { toast('Шкала: минимум 2 неотрицательные ступени, верхняя > 0'); return; }
+    if (allowNa && !naCondition) { toast('Укажите условие N/A'); return; }
 
-    let checklist = state.checklists['custom'];
-    if (!checklist) {
-      checklist = JSON.parse(JSON.stringify(state.checklists['default']));
-      checklist.version = (checklist.version || 1) + 1;
-      checklist.name = 'Пользовательский чек-лист CQA';
-      state.checklists['custom'] = checklist;
-      state.activeChecklistKey = 'custom';
+    const isNew = !document.getElementById('crit-edit-id').readOnly;
+    const draft = editableChecklist();
+    if (isNew && draft.criteria.some(c => c.id === id)) { toast('Критерий с таким ID уже есть'); return; }
+    let crit = draft.criteria.find(c => c.id === id);
+    if (!crit) {
+      crit = { id, order: Math.max(0, ...draft.criteria.map(c => c.order || 0)) + 1 };
+      draft.criteria.push(crit);
     }
+    Object.assign(crit, { title, section, type, weight, allow_na: allowNa, na_condition: allowNa ? naCondition : null, instruction, rules });
+    if (type === 'scale') {
+      const old = crit.step_descriptions || {};
+      crit.steps = steps.sort((x, y) => y - x);
+      crit.step_descriptions = Object.fromEntries(crit.steps.map(v => [String(v), old[String(v)] || '']));
+    } else { delete crit.steps; delete crit.step_descriptions; }
 
-    let crit = checklist.criteria.find(c => c.id === id);
-    if (crit) {
-      crit.title = title;
-      crit.section = section;
-      crit.type = type;
-      crit.weight = weight;
-      crit.allow_na = allowNa;
-      crit.instruction = instruction;
-      crit.rules = rules;
-    } else {
-      checklist.criteria.push({
-        id,
-        title,
-        section,
-        type,
-        weight,
-        allow_na: allowNa,
-        steps: type === 'scale' ? [20, 15, 10, 5, 0] : undefined,
-        instruction,
-        rules
-      });
-    }
-
-    localStorage.setItem('cqa_custom_checklist', JSON.stringify(checklist));
+    saveDraft();
     closeModal('criterion-modal');
+    renderChecklistPicker();
     renderChecklistTable();
   }
 
   function deleteCriterion(critId) {
-    if (!confirm(`Удалить критерий ${critId} из чек-листа?`)) return;
-    let checklist = state.checklists['custom'];
-    if (!checklist) {
-      checklist = JSON.parse(JSON.stringify(state.checklists['default']));
-      state.checklists['custom'] = checklist;
-      state.activeChecklistKey = 'custom';
-    }
-    checklist.criteria = checklist.criteria.filter(c => c.id !== critId);
-    localStorage.setItem('cqa_custom_checklist', JSON.stringify(checklist));
+    if (!confirm(`Удалить критерий ${critId} из чек-листа? Изменение попадёт в черновик.`)) return;
+    const draft = editableChecklist();
+    draft.criteria = draft.criteria.filter(c => c.id !== critId);
+    saveDraft();
+    renderChecklistPicker();
     renderChecklistTable();
   }
 
   function resetChecklist() {
-    if (!confirm('Сбросить чек-лист к исходным 8 критериям Freedom Broker?')) return;
-    localStorage.removeItem('cqa_custom_checklist');
-    delete state.checklists['custom'];
-    state.activeChecklistKey = 'default';
-    document.getElementById('checklist-picker').value = 'default';
-    renderChecklistTable();
-    alert('Чек-лист сброшен к заводским настройкам Freedom Broker!');
+    if (!state.checklists['draft']) { toast('Несохранённых изменений нет'); return; }
+    if (!confirm('Удалить черновик и вернуться к сохранённому чек-листу?')) return;
+    const basedOn = state.checklists['draft'].based_on;
+    delete state.checklists['draft'];
+    try { localStorage.removeItem('cqa_checklist_draft'); } catch (e) { /* storage off */ }
+    state.activeChecklistKey = state.checklists[basedOn] ? basedOn : Object.keys(state.checklists)[0];
+    renderChecklistPicker();
+    renderAll();
   }
 
-  function applyChecklistChanges() {
-    const checklist = state.checklists[state.activeChecklistKey] || state.checklists['default'];
-
-    state.conversations.forEach(conv => {
-      const ev = state.evaluations[conv.conversation_id];
-      if (ev) {
-        const answersMap = {};
-        ev.criteria.forEach(c => answersMap[c.id] = c.answer);
-        checklist.criteria.forEach(c => {
-          if (!answersMap[c.id]) answersMap[c.id] = c.type === 'scale' ? c.steps[0] : (c.type === 'flag' ? 'no' : 'yes');
-        });
-
-        const scored = computeScore(checklist, answersMap);
-        ev.total = scored.total;
-        ev.section_scores = scored.section_scores;
-        conv.total_score = scored.total;
-
-        ev.criteria = scored.criteria.map(scCrit => {
-          const orig = ev.criteria.find(c => c.id === scCrit.id) || {};
-          return {
-            id: scCrit.id,
-            title: scCrit.title,
-            section: scCrit.section,
-            answer: scCrit.answer,
-            applicable: scCrit.applicable,
-            weight: scCrit.weight,
-            effective_weight: scCrit.effective_weight,
-            points: scCrit.points,
-            explanation: orig.explanation || `Оценка по обновленному чек-листу: ${scCrit.answer}`,
-            rules: scCrit.rules || '',
-            evidence: orig.evidence || [],
-            na_reason: orig.na_reason || null,
-            appeal: orig.appeal || null
-          };
-        });
+  async function applyChecklistChanges() {
+    if (!isLive()) { toast('Сохранение чек-листа и пересчёт оценок выполняет сервер. Сейчас открыты демо-данные; черновик сохранён в браузере.'); return; }
+    const btn = document.getElementById('btn-apply-checklist-changes');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Сохраняем и оцениваем…'; }
+    try {
+      let checklistId = activeChecklist() && activeChecklist().id;
+      if (state.activeChecklistKey === 'draft') {
+        const draft = Object.assign({}, state.checklists['draft']);
+        delete draft.based_on;
+        const saved = await api().saveChecklist(draft);
+        checklistId = saved && (saved.id || saved.checklist_id);
+        if (!checklistId) throw new Error('сервер не вернул id чек-листа');
+        await api().activateChecklist(checklistId);
+        delete state.checklists['draft'];
+        try { localStorage.removeItem('cqa_checklist_draft'); } catch (e) { /* storage off */ }
+        state.checklists = await api().getChecklists();
+        state.activeChecklistKey = checklistId;
+        renderChecklistPicker();
       }
-    });
+      const ids = state.conversations.filter(c => (activeChecklist().applies_to || 'agent chat') === c.channel).map(c => c.conversation_id);
+      if (!ids.length) { toast('Нет диалогов для канала ' + (activeChecklist().applies_to || 'agent chat')); return; }
+      if (!confirm(`Оценить ${ids.length} диалог(ов) по чек-листу «${activeChecklist().name}» v${activeChecklist().version}? Это вызовет модель для каждого диалога.`)) return;
+      await api().evaluateBatch(ids, checklistId);
+      state.conversations = await api().getConversations();
+      state.evaluations = {};
+      if (state.activeConvId) await ensureEvaluationLoaded(state.activeConvId, true);
+      collectAppeals();
+      renderAll();
+      toast(`Готово: ${ids.length} диалог(ов) отправлено на оценку по новой версии`);
+    } catch (e) {
+      toast('Не удалось применить чек-лист: ' + e.message);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'Сохранить и применить к диалогам'; }
+    }
+  }
 
+  // Display thresholds (settings, not part of the task rules)
+  function openSettingsModal() {
+    document.getElementById('set-good').value = state.settings.good;
+    document.getElementById('set-excellent').value = state.settings.excellent;
+    document.getElementById('set-target').value = state.settings.target;
+    const m = document.getElementById('settings-modal');
+    if (m) m.classList.add('active');
+  }
+  function saveSettingsModal() {
+    const g = Number(document.getElementById('set-good').value);
+    const e = Number(document.getElementById('set-excellent').value);
+    const t = Number(document.getElementById('set-target').value);
+    if (![g, e, t].every(v => v >= 0 && v <= 100) || g > e) { toast('Пороги: числа 0–100, «хорошо» ≤ «отлично»'); return; }
+    state.settings = { good: g, excellent: e, target: t };
+    saveSettings();
+    closeModal('settings-modal');
     renderAll();
-    alert('Обновленный чек-лист успешно применен ко всем диалогам! Баллы пересчитаны на лету.');
   }
 
   // API Configuration Modal
   function openApiModal() {
-    const isLive = window.CQA_API && window.CQA_API.isLiveApi();
-    const sourceSelect = document.getElementById('api-source-select');
     const urlInput = document.getElementById('api-url-input');
-    const urlGroup = document.getElementById('api-url-group');
-
-    if (sourceSelect) sourceSelect.value = isLive ? 'live' : 'mock';
-    if (urlInput) urlInput.value = (window.CQA_API && window.CQA_API.getBaseUrl()) || 'http://localhost:8000/api';
-    if (urlGroup) urlGroup.style.display = isLive ? 'flex' : 'none';
-
-    if (sourceSelect) {
-      sourceSelect.onchange = () => {
-        if (urlGroup) urlGroup.style.display = sourceSelect.value === 'live' ? 'flex' : 'none';
-      };
-    }
-
+    if (urlInput) urlInput.value = api().getBaseUrl();
+    const st = document.getElementById('api-modal-state');
+    if (st) st.textContent = isLive() ? 'Подключено к серверу.' : 'Сервер не отвечает — показаны демо-данные.';
     const modal = document.getElementById('api-modal');
     if (modal) modal.classList.add('active');
   }
 
   function saveApiConfig() {
-    const sourceSelect = document.getElementById('api-source-select');
     const urlInput = document.getElementById('api-url-input');
-
-    if (sourceSelect && sourceSelect.value === 'live') {
-      const url = urlInput ? urlInput.value.trim() : 'http://localhost:8000/api';
-      if (window.CQA_API) window.CQA_API.setBaseUrl(url);
-      localStorage.setItem('cqa_api_url', url);
-    } else {
-      if (window.CQA_API) window.CQA_API.setBaseUrl(null);
-      localStorage.removeItem('cqa_api_url');
-    }
-
+    api().setBaseUrl(urlInput ? urlInput.value : '');
     closeModal('api-modal');
     loadData();
   }
@@ -1126,7 +1167,7 @@
       c.conversation_id,
       `"${c.channel}"`,
       c.language,
-      c.total_score !== null ? c.total_score : 'N/A',
+      c.total_score !== null && c.total_score !== undefined ? c.total_score : '',
       c.gross_error ? 'ДА' : 'НЕТ',
       c.has_appeal ? 'ДА' : 'НЕТ'
     ]);
@@ -1146,9 +1187,9 @@
   function exportJSON() {
     const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify({
       exported_at: new Date().toISOString(),
-      conversations: state.conversations,
+      source: isLive() ? api().getBaseUrl() : 'demo',
       evaluations: state.evaluations,
-      checklist: state.checklists[state.activeChecklistKey] || state.checklists['default']
+      checklist: activeChecklist()
     }, null, 2));
     const downloadAnchor = document.createElement('a');
     downloadAnchor.setAttribute('href', dataStr);
@@ -1168,13 +1209,29 @@
     switchTab('tab-workspace');
   }
 
-  function scrollToReplica(msgIndex) {
-    const el = document.getElementById(`msg-${msgIndex}`);
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      el.classList.add('pulse-highlight');
-      setTimeout(() => el.classList.remove('pulse-highlight'), 2200);
+  function scrollToReplica(msgIndex, toIndex) {
+    const last = toIndex !== undefined ? toIndex : msgIndex;
+    for (let i = msgIndex; i <= last; i++) {
+      const m = document.getElementById(`msg-${i}`);
+      if (m) { m.classList.add('pulse-highlight'); setTimeout(() => m.classList.remove('pulse-highlight'), 2200); }
     }
+    const el = document.getElementById(`msg-${msgIndex}`);
+    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    seekAudioToReplica(msgIndex);
+  }
+
+  // For voice calls: jump the recording to the replica time (ISO timestamps, offset from the first one)
+  function seekAudioToReplica(i) {
+    const conv = state.conversations.find(c => c.conversation_id === state.activeConvId);
+    const audio = document.getElementById('html5-audio-element');
+    if (!conv || !audio || conv.channel !== 'voice call' || !conv.transcript || !conv.transcript[i]) return;
+    const t = ts => { const d = Date.parse(ts); return isNaN(d) ? null : d / 1000; };
+    const first = conv.transcript.map(m => t(m.timestamp)).find(x => x !== null);
+    const cur = t(conv.transcript[i].timestamp);
+    if (first === undefined || cur === null) return;
+    try { audio.currentTime = Math.max(0, cur - first); } catch (e) { /* not loaded yet */ }
+    const link = document.getElementById('audio-external-link');
+    if (link && conv.audio_url) link.href = conv.audio_url.split('#')[0] + '#t=' + Math.floor(Math.max(0, cur - first));
   }
 
   function switchTab(tabId) {
@@ -1201,6 +1258,14 @@
         renderAll();
       };
     }
+    const typeSel = document.getElementById('crit-edit-type');
+    if (typeSel) typeSel.onchange = toggleTypeFields;
+    const naChk = document.getElementById('crit-edit-allow-na');
+    if (naChk) naChk.onchange = toggleTypeFields;
+    const setBtn = document.getElementById('btn-open-settings');
+    if (setBtn) setBtn.onclick = openSettingsModal;
+    const setSave = document.getElementById('btn-save-settings');
+    if (setSave) setSave.onclick = saveSettingsModal;
 
     const searchInput = document.getElementById('conv-search-input');
     if (searchInput) {
@@ -1292,6 +1357,8 @@
     closeModal,
     openApiModal,
     saveApiConfig,
+    openSettingsModal,
+    evaluateActive,
     reloadConversations: loadData,
     exportCSV,
     exportJSON

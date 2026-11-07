@@ -25,7 +25,7 @@
       </button>
       <button class="nav-tab-btn" data-tab="tab-appeals" id="nav-btn-appeals">
         <span>⚖️ Арбитраж и апелляции</span>
-        <span class="nav-badge" id="appeals-badge-count">1</span>
+        <span class="nav-badge" id="appeals-badge-count" style="display: none;">0</span>
       </button>
       <button class="nav-tab-btn" data-tab="tab-analytics" id="nav-btn-analytics">
         <span>📊 Сводная аналитика</span>
@@ -37,16 +37,20 @@
 
     <!-- NAVBAR RIGHT: STATUS & CONFIG -->
     <div class="navbar-right">
-      <select id="checklist-picker" class="checklist-selector" title="Выбор активного чек-листа">
-        <option value="default">Чек-лист чатов Freedom (8 критериев)</option>
-        <option value="calls">Чек-лист звонков Freedom (8 критериев)</option>
-      </select>
+      <select id="checklist-picker" class="checklist-selector" title="Активный чек-лист (загружается с сервера)"></select>
       <div class="api-status" id="api-status-pill" onclick="app.openApiModal()" style="cursor: pointer;" title="Нажмите для настройки источника данных API">
         <span class="status-dot"></span>
-        <span id="api-status-text">Файл-заглушка (mock_data.json)</span>
+        <span id="api-status-text">Подключение…</span>
       </div>
     </div>
   </header>
+
+  <!-- DEMO MODE BANNER: shown when the server is unavailable -->
+  <div id="demo-mode-banner" class="demo-mode-banner" style="display: none;">
+    <strong>ДЕМО-ДАННЫЕ</strong>
+    <span>Сервер недоступен. Показаны синтетические диалоги и заранее заданные демо-оценки только для проверки интерфейса. Оценка, апелляции и сохранение чек-листа работают только с сервером.</span>
+    <button class="btn-retry" onclick="app.openApiModal()">Подключить сервер</button>
+  </div>
 
   <!-- GLOBAL ERROR / LOADING BANNERS -->
   <div id="global-error-banner" class="global-error-banner" style="display: none;">
@@ -111,7 +115,7 @@
               <div class="audio-timeline">
                 <input type="range" id="audio-seek" value="0" min="0" max="100">
               </div>
-              <span id="audio-time-duration" style="font-size: 11px; color: var(--text-muted); min-width: 40px;">03:15</span>
+              <span id="audio-time-duration" style="font-size: 11px; color: var(--text-muted); min-width: 40px;">00:00</span>
               <select id="audio-speed" class="audio-speed-select">
                 <option value="0.75">0.75x</option>
                 <option value="1" selected>1.0x</option>
@@ -140,11 +144,12 @@
                 <div>
                   <span style="font-size: 11px; color: var(--text-muted); font-weight: 600; text-transform: uppercase;">Итоговый балл CQA</span>
                   <div class="score-main">
-                    <span class="score-num" id="total-score-display">0.00</span>
+                    <span class="score-num" id="total-score-display">—</span>
                     <span class="score-max">/ 100</span>
+                    <span id="total-score-original" class="score-original" style="display: none;"></span>
                   </div>
                 </div>
-                <div class="score-label-badge badge-excellent" id="score-status-badge">Отлично</div>
+                <div class="score-label-badge badge-warning" id="score-status-badge">—</div>
               </div>
 
               <!-- CRITICAL VIOLATION WARNING BANNER -->
@@ -159,9 +164,10 @@
               </div>
 
               <div class="eval-meta-row">
-                <span id="eval-model-tag">Модель: Gemini 2.0 Flash</span>
-                <span id="eval-cost-tag">Стоимость: $0.0012</span>
-                <span id="eval-version-tag">Чек-лист: v1</span>
+                <span id="eval-demo-tag" class="demo-tag" style="display: none;">ДЕМО-ДАННЫЕ</span>
+                <span id="eval-model-tag">Модель: —</span>
+                <span id="eval-cost-tag">Стоимость: —</span>
+                <span id="eval-version-tag">Чек-лист: —</span>
               </div>
             </div>
           </div>
@@ -191,8 +197,8 @@
               <tr>
                 <th>ID диалога</th>
                 <th>Критерий</th>
-                <th>Оценка ИИ</th>
-                <th>Комментарий оператора</th>
+                <th>Текущая оценка</th>
+                <th>Комментарий апелляции</th>
                 <th>Статус</th>
                 <th>Действие проверяющего</th>
               </tr>
@@ -211,12 +217,12 @@
         <div class="view-header">
           <div>
             <h2>Конструктор чек-листа оценки качества</h2>
-            <p>Управление критериями, весами, формулировками и шкалами. Изменения сохраняются и сразу применяются к диалогам.</p>
+            <p>Критерии, веса, формулировки, шкалы и правила. Изменения попадают в черновик; «Сохранить и применить» сохраняет новую версию на сервере (POST /api/checklists) и переоценивает диалоги.</p>
           </div>
           <div class="checklist-builder-actions">
-            <button class="btn-secondary" id="btn-reset-checklist">Сбросить к стандарту Freedom</button>
+            <button class="btn-secondary" id="btn-reset-checklist">Отменить черновик</button>
             <button class="btn-primary" id="btn-add-criterion">+ Добавить критерий</button>
-            <button class="btn-primary" id="btn-apply-checklist-changes" style="background: var(--primary-dark);">Применить к диалогам и пересчитать</button>
+            <button class="btn-primary" id="btn-apply-checklist-changes" style="background: var(--primary-dark);">Сохранить и применить к диалогам</button>
           </div>
         </div>
 
@@ -241,7 +247,7 @@
                 <th>#</th>
                 <th>Секция</th>
                 <th>Критерий</th>
-                <th>Тип</th>
+                <th>Тип / условие N/A</th>
                 <th>Вес</th>
                 <th>N/A</th>
                 <th style="min-width: 220px;">Правила и уточнения (rules)</th>
@@ -265,6 +271,7 @@
             <p>Комплексный мониторинг соблюдения стандартов сервиса, эффективности работы операторов и комплаенс-рисков</p>
           </div>
           <div class="export-actions">
+            <button class="btn-secondary" id="btn-open-settings">⚙ Пороги отображения</button>
             <button class="btn-secondary" id="btn-export-json">💾 Экспорт в JSON</button>
             <button class="btn-primary" id="btn-export-csv">📥 Экспорт отчета в CSV</button>
           </div>
@@ -274,22 +281,22 @@
         <div class="kpi-grid">
           <div class="kpi-card">
             <span class="kpi-title">Средний CQA Index</span>
-            <div class="kpi-val" id="kpi-avg-score">88.4%</div>
-            <span class="kpi-sub">Целевой норматив: ≥ 85.0%</span>
+            <div class="kpi-val" id="kpi-avg-score">—</div>
+            <span class="kpi-sub" id="kpi-target-sub">Целевой уровень (настройка)</span>
           </div>
           <div class="kpi-card">
             <span class="kpi-title">Проверено обращений</span>
-            <div class="kpi-val" id="kpi-total-convs">65</div>
-            <span class="kpi-sub">60 чатов · 5 аудиозвонков</span>
+            <div class="kpi-val" id="kpi-total-convs">—</div>
+            <span class="kpi-sub" id="kpi-total-sub">—</span>
           </div>
           <div class="kpi-card">
             <span class="kpi-title">Инциденты комплаенс</span>
-            <div class="kpi-val" id="kpi-gross-errors" style="color: var(--danger);">1</div>
+            <div class="kpi-val" id="kpi-gross-errors" style="color: var(--danger);">—</div>
             <span class="kpi-sub">Грубые ошибки регламента</span>
           </div>
           <div class="kpi-card">
             <span class="kpi-title">Индекс апелляций</span>
-            <div class="kpi-val" id="kpi-appeals-count" style="color: var(--warning);">1</div>
+            <div class="kpi-val" id="kpi-appeals-count" style="color: var(--warning);">—</div>
             <span class="kpi-sub">Обращений на пересмотр</span>
           </div>
         </div>
@@ -305,28 +312,7 @@
 
           <div class="data-table-card" style="padding: 20px;">
             <h3 style="font-size: 15px; margin-bottom: 14px;">Показатели по каналам и языковым группам</h3>
-            <div class="lang-channel-grid">
-              <div class="stat-pill-row">
-                <span>💬 Текстовые чаты (agent chat):</span>
-                <strong>60 обращений</strong>
-              </div>
-              <div class="stat-pill-row">
-                <span>📞 Голосовые звонки (voice call):</span>
-                <strong>5 аудиосессий</strong>
-              </div>
-              <div class="stat-pill-row">
-                <span>🇷🇺 Русский язык (RU):</span>
-                <strong>35 диалогов (54%)</strong>
-              </div>
-              <div class="stat-pill-row">
-                <span>🇰🇿 Казахский язык (KZ):</span>
-                <strong>15 диалогов (23%)</strong>
-              </div>
-              <div class="stat-pill-row">
-                <span>🇬🇧 Английский язык (EN):</span>
-                <strong>15 диалогов (23%)</strong>
-              </div>
-            </div>
+            <div class="lang-channel-grid" id="lang-channel-grid"></div>
           </div>
         </div>
 
@@ -338,7 +324,7 @@
               <tr>
                 <th>Критерий оценки</th>
                 <th>Секция</th>
-                <th>Базовый вес</th>
+                <th>Вес</th>
                 <th>Уровень соблюдения</th>
                 <th>Статус критерия</th>
               </tr>
@@ -404,17 +390,13 @@
         <div class="form-group">
           <label>Решение проверяющего:</label>
           <select id="review-modal-decision-type" class="form-control">
-            <option value="change">Изменить оценку и пересчитать балл</option>
-            <option value="confirm">Подтвердить исходную оценку ИИ</option>
+            <option value="confirm">Подтвердить оценку</option>
+            <option value="change">Изменить оценку (итог пересчитает сервер)</option>
           </select>
         </div>
         <div class="form-group" id="review-new-answer-group">
           <label>Новая оценка:</label>
-          <select id="review-modal-new-answer" class="form-control">
-            <option value="yes">Да (полный балл)</option>
-            <option value="no">Нет (0 баллов)</option>
-            <option value="na">N/A (исключить и перераспределить вес)</option>
-          </select>
+          <select id="review-modal-new-answer" class="form-control"></select>
         </div>
         <div class="form-group">
           <label>Обоснование решения проверяющего:</label>
@@ -446,12 +428,8 @@
         </div>
         <div class="form-group">
           <label>Секция:</label>
-          <select id="crit-edit-section" class="form-control">
-            <option value="Начало и понимание запроса">Начало и понимание запроса</option>
-            <option value="Безопасность и решение">Безопасность и решение</option>
-            <option value="Ведение и завершение диалога">Ведение и завершение диалога</option>
-            <option value="Грубые нарушения">Грубые нарушения</option>
-          </select>
+          <input type="text" id="crit-edit-section" class="form-control" list="crit-edit-section-list" placeholder="Секция из чек-листа или новая">
+          <datalist id="crit-edit-section-list"></datalist>
         </div>
         <div class="form-group">
           <label>Тип ответа:</label>
@@ -469,6 +447,14 @@
           <label>
             <input type="checkbox" id="crit-edit-allow-na"> Разрешить оценку N/A (неприменимо)
           </label>
+        </div>
+        <div class="form-group" id="crit-edit-na-group" style="display: none;">
+          <label>Условие N/A:</label>
+          <input type="text" id="crit-edit-na-condition" class="form-control" placeholder="Например: запрос не требовал идентификации">
+        </div>
+        <div class="form-group" id="crit-edit-steps-group" style="display: none;">
+          <label>Ступени шкалы (через запятую, верхняя = полный вес):</label>
+          <input type="text" id="crit-edit-steps" class="form-control" placeholder="20, 15, 10, 5, 0">
         </div>
         <div class="form-group">
           <label>Инструкция по оценке:</label>
@@ -490,33 +476,47 @@
   <div class="modal-overlay" id="api-modal">
     <div class="modal-box">
       <div class="modal-header">
-        <h3>Подключение к API (Сервер Алихана)</h3>
+        <h3>Источник данных</h3>
         <button class="close-btn" onclick="app.closeModal('api-modal')">✕</button>
       </div>
       <div class="modal-body">
         <div class="form-group">
-          <label>Источник данных:</label>
-          <select id="api-source-select" class="form-control">
-            <option value="mock">Файл-заглушка (mock_data.json)</option>
-            <option value="live">Сервер FastAPI (Алихан)</option>
-          </select>
-        </div>
-        <div class="form-group" id="api-url-group">
-          <label>URL API сервера:</label>
-          <input type="text" id="api-url-input" class="form-control" value="http://localhost:8000/api">
-          <span style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Формат ответа соответствует контракту AGENTS.md</span>
+          <label>Адрес API сервера:</label>
+          <input type="text" id="api-url-input" class="form-control" placeholder="http://localhost:8000/api">
+          <span id="api-modal-state" style="font-size: 12px; color: var(--text-muted); margin-top: 4px;"></span>
+          <span style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Если GET /health не отвечает, интерфейс показывает демо-данные с пометкой.</span>
         </div>
       </div>
       <div class="modal-footer">
         <button class="btn-secondary" onclick="app.closeModal('api-modal')">Отмена</button>
-        <button class="btn-primary" id="btn-save-api-config">Применить источник</button>
+        <button class="btn-primary" id="btn-save-api-config">Подключиться</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: DISPLAY THRESHOLDS (settings; not part of the checklist, do not affect scores) -->
+  <div class="modal-overlay" id="settings-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>Пороги отображения (настройка)</h3>
+        <button class="close-btn" onclick="app.closeModal('settings-modal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 12px; color: var(--text-muted);">Этих порогов нет в задании: они только раскрашивают итоги и дашборд и не влияют на баллы.</p>
+        <div class="form-group"><label>«Хорошо» от:</label><input type="number" id="set-good" class="form-control" min="0" max="100"></div>
+        <div class="form-group"><label>«Отлично» от:</label><input type="number" id="set-excellent" class="form-control" min="0" max="100"></div>
+        <div class="form-group"><label>Целевой уровень по критерию, %:</label><input type="number" id="set-target" class="form-control" min="0" max="100"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" onclick="app.closeModal('settings-modal')">Отмена</button>
+        <button class="btn-primary" id="btn-save-settings">Сохранить</button>
       </div>
     </div>
   </div>
 
   <!-- SCRIPT INCLUDES -->
-  <script src="mock_data.js"></script>
-  <script src="checklists.js"></script>
+  <!-- Demo data: synthetic, used only when the server is unavailable (web/demo/build_demo.py) -->
+  <script src="demo/demo_data.js"></script>
   <script src="api.js"></script>
   <script src="app.js"></script>
 </body>
