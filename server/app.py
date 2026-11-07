@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from uuid import uuid4
 from html import escape
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,6 +13,8 @@ from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
+
+from src.cqa.scoring import validate_checklist
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -49,6 +52,66 @@ def _init_db() -> None:
             transcript TEXT NOT NULL,
             audio_url TEXT
         )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS checklists (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            applies_to TEXT NOT NULL CHECK (applies_to IN ('agent chat', 'voice call')),
+            checklist_json TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0, 1)),
+            UNIQUE (name, applies_to, version)
+        )""")
+        db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS one_active_checklist_per_channel
+            ON checklists(applies_to) WHERE active = 1""")
+        db.execute("""CREATE TABLE IF NOT EXISTS evaluations (
+            id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            checklist_id TEXT NOT NULL REFERENCES checklists(id),
+            checklist_version INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            answers_json TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            total REAL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            duration_seconds REAL,
+            input_tokens INTEGER,
+            output_tokens INTEGER,
+            cost_usd REAL
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS appeals (
+            id TEXT PRIMARY KEY,
+            evaluation_id TEXT NOT NULL REFERENCES evaluations(id),
+            criterion_id TEXT NOT NULL,
+            comment TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'open',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS decisions (
+            id TEXT PRIMARY KEY,
+            appeal_id TEXT NOT NULL UNIQUE REFERENCES appeals(id),
+            decision TEXT NOT NULL,
+            new_answer TEXT,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        for filename, seed_id in (("checklist.default.json", "default-chat-v1"),
+                                  ("checklist.calls.json", "default-call-v1")):
+            checklist = json.loads((ROOT / "src" / "cqa" / filename).read_text(encoding="utf-8"))
+            validate_checklist(checklist)
+            channel = checklist["applies_to"]
+            has_active = db.execute("SELECT 1 FROM checklists WHERE applies_to = ? AND active = 1", (channel,)).fetchone()
+            db.execute("""INSERT OR IGNORE INTO checklists
+                (id, name, version, applies_to, checklist_json, active) VALUES (?, ?, ?, ?, ?, ?)""",
+                (seed_id, checklist["name"], checklist["version"], channel,
+                 json.dumps(checklist, ensure_ascii=False), 0 if has_active else 1))
+
+
+def _checklist_response(row: sqlite3.Row, include_json: bool = False) -> dict:
+    result = {"id": row["id"], "name": row["name"], "version": row["version"],
+              "applies_to": row["applies_to"], "active": bool(row["active"])}
+    if include_json:
+        result.update(json.loads(row["checklist_json"]))
+    return result
 
 
 def import_conversations() -> int:
@@ -100,6 +163,68 @@ def health() -> dict:
     with _connect() as db:
         db.execute("SELECT 1")
     return {"status": "ok"}
+
+
+@app.get("/api/checklists")
+def list_checklists() -> list[dict]:
+    with _connect() as db:
+        rows = db.execute("SELECT * FROM checklists ORDER BY applies_to, name, version DESC").fetchall()
+    return [_checklist_response(row) for row in rows]
+
+
+@app.get("/api/checklists/{checklist_id}")
+def get_checklist(checklist_id: str) -> dict:
+    with _connect() as db:
+        row = db.execute("SELECT * FROM checklists WHERE id = ?", (checklist_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Checklist not found")
+    return _checklist_response(row, include_json=True)
+
+
+@app.post("/api/checklists", status_code=201)
+def create_checklist(checklist: dict) -> dict:
+    """Save an immutable version; activate it with the separate activate endpoint."""
+    channel = checklist.get("applies_to")
+    name = checklist.get("name")
+    if channel not in ("agent chat", "voice call") or not isinstance(name, str) or not name.strip():
+        raise HTTPException(status_code=422, detail="name and valid applies_to are required")
+    try:
+        validate_checklist(checklist)
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid checklist: {exc}") from None
+    new_id = uuid4().hex
+    with _connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        base_id = checklist.get("id") or checklist.get("base_id")
+        if base_id:
+            base = db.execute("SELECT name, applies_to FROM checklists WHERE id = ?", (base_id,)).fetchone()
+            if base is None:
+                raise HTTPException(status_code=404, detail="Base checklist not found")
+            if base["name"] != name or base["applies_to"] != channel:
+                raise HTTPException(status_code=422, detail="Base checklist name or channel differs")
+        version = db.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM checklists WHERE name = ? AND applies_to = ?",
+                             (name, channel)).fetchone()[0]
+        stored = {k: v for k, v in checklist.items() if k not in ("id", "base_id", "active")}
+        stored["version"] = version
+        active = 0 if db.execute("SELECT 1 FROM checklists WHERE applies_to = ? AND active = 1", (channel,)).fetchone() else 1
+        db.execute("""INSERT INTO checklists (id, name, version, applies_to, checklist_json, active)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (new_id, name, version, channel, json.dumps(stored, ensure_ascii=False), active))
+        row = db.execute("SELECT * FROM checklists WHERE id = ?", (new_id,)).fetchone()
+    return _checklist_response(row, include_json=True)
+
+
+@app.post("/api/checklists/{checklist_id}/activate")
+def activate_checklist(checklist_id: str) -> dict:
+    with _connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT * FROM checklists WHERE id = ?", (checklist_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="Checklist not found")
+        db.execute("UPDATE checklists SET active = 0 WHERE applies_to = ?", (row["applies_to"],))
+        db.execute("UPDATE checklists SET active = 1 WHERE id = ?", (checklist_id,))
+        row = db.execute("SELECT * FROM checklists WHERE id = ?", (checklist_id,)).fetchone()
+    return _checklist_response(row)
 
 
 @app.get("/api/conversations")
