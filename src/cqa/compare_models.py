@@ -204,7 +204,10 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="build prompts and exit, no API calls")
     args = ap.parse_args()
 
-    checklist = evaluator.load_checklist(CHECKLIST)
+    try:
+        checklist = evaluator.load_checklist(CHECKLIST)
+    except evaluator.ChecklistError as e:
+        sys.exit(str(e))
     if not DEV.exists():
         sys.exit(f"{DEV} not found: run python3 src/cqa/fetch_data.py first")
     records = json.loads(DEV.read_text(encoding="utf-8"))["data"]["records"]

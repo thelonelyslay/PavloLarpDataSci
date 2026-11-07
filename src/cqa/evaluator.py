@@ -5,7 +5,8 @@ Nothing is cached or precomputed: every call sends the dialog to the model.
 
 Python:
     from evaluator import evaluate
-    result = evaluate(record, checklist)                  # model chain from EVAL_MODELS in .env
+    result = evaluate(record)                             # checklist by channel, models from EVAL_MODELS
+    result = evaluate(record, checklist)                  # given checklist (validated, ChecklistError if bad)
     result = evaluate(record, checklist, "claude-opus-5-5")  # one model, no fallback
 
 CLI:
@@ -18,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -32,10 +34,70 @@ DEV = ROOT / "data" / "raw" / "dev.json"
 CHECKLIST_FILES = [HERE / "checklist.default.json", HERE / "checklist.calls.json"]  # first = default
 DEFAULT_OPTS = {"effort": "low", "gemini_thinking": "auto"}
 ATTEMPTS_PER_MODEL = 2  # 1 retry on API error (after HTTP retries) or invalid answer, then next model
+DEFAULT_TIMEOUT = 120.0  # seconds for one evaluation, all models together; .env: EVAL_TIMEOUT
+CRITERION_TYPES = ("yes_no", "scale", "flag")
 
 
 class EvaluationError(RuntimeError):
-    """All models in the chain failed."""
+    """All models in the chain failed or the time limit (EVAL_TIMEOUT) is over."""
+
+
+class ChecklistError(ValueError):
+    """The checklist is filled in wrongly (message in Russian, for the user)."""
+
+
+def _is_number(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def validate_checklist_fields(checklist: dict) -> None:
+    """Check what the UI may break: id, title, type, weight, allowed answers. Raise ChecklistError in Russian."""
+    crits = checklist.get("criteria") if isinstance(checklist, dict) else None
+    if not isinstance(crits, list) or not crits:
+        raise ChecklistError("Чек-лист заполнен неверно: в нём нет ни одного критерия (поле criteria).")
+    errs: list[str] = []
+    seen: set = set()
+    scored_weight = 0.0
+    for n, c in enumerate(crits, 1):
+        if not isinstance(c, dict):
+            errs.append(f"критерий №{n}: должен быть объектом")
+            continue
+        cid = str(c.get("id") or "").strip()
+        name = f"критерий «{c.get('title') or cid or n}»" if (c.get("title") or cid) else f"критерий №{n}"
+        if not cid:
+            errs.append(f"{name}: нет идентификатора (id)")
+        elif cid in seen:
+            errs.append(f"{name}: идентификатор «{cid}» повторяется")
+        seen.add(cid)
+        if not str(c.get("title") or "").strip():
+            errs.append(f"{name}: нет названия (title)")
+        ctype = c.get("type")
+        if ctype not in CRITERION_TYPES:
+            errs.append(f"{name}: неизвестный тип {ctype!r}; допустимо yes_no (да/нет), scale (шкала) или flag (флаг)")
+        w = c.get("weight")
+        if not _is_number(w):
+            errs.append(f"{name}: вес (weight) не указан или не число")
+        elif w < 0:
+            errs.append(f"{name}: вес не может быть отрицательным ({w})")
+        elif ctype == "flag" and w != 0:
+            errs.append(f"{name}: у флага не может быть веса (сейчас {w}). Флаг отмечается отдельно и в итог"
+                        " не входит, поставьте вес 0")
+        elif ctype != "flag":
+            scored_weight += w
+        if "allow_na" in c and not isinstance(c["allow_na"], bool):
+            errs.append(f"{name}: allow_na должно быть true или false")
+        if ctype == "scale":
+            steps = c.get("steps")
+            if not isinstance(steps, list) or len(steps) < 2 or not all(_is_number(s) for s in steps):
+                errs.append(f"{name}: у шкалы нужен список допустимых баллов steps, минимум 2 числа")
+            elif min(steps) < 0 or max(steps) <= 0:
+                errs.append(f"{name}: баллы шкалы не могут быть отрицательными, а верхний должен быть больше 0")
+            elif len(set(steps)) != len(steps):
+                errs.append(f"{name}: баллы шкалы повторяются {steps}")
+    if not errs and scored_weight <= 0:
+        errs.append("сумма весов оцениваемых критериев равна 0, итог посчитать нельзя")
+    if errs:
+        raise ChecklistError("Чек-лист заполнен неверно:\n- " + "\n- ".join(errs))
 
 
 def model_chain(env: dict, model_name: Optional[str] = None) -> list[str]:
@@ -47,8 +109,13 @@ def model_chain(env: dict, model_name: Optional[str] = None) -> list[str]:
 
 
 def load_checklist(path: Path) -> dict:
-    checklist = json.loads(Path(path).read_text(encoding="utf-8"))
-    checklist.setdefault("id", Path(path).stem)
+    try:
+        checklist = json.loads(Path(path).read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ChecklistError(f"Чек-лист {Path(path).name} не читается как JSON: строка {e.lineno}, {e.msg}") from None
+    if isinstance(checklist, dict):
+        checklist.setdefault("id", Path(path).stem)
+    validate_checklist_fields(checklist)
     scoring.validate_checklist(checklist)
     return checklist
 
@@ -109,18 +176,33 @@ def build_result(record: dict, checklist: dict, answers: dict, details: dict,
     }
 
 
-def evaluate(record: dict, checklist: dict, model_name: Optional[str] = None, *,
+def _timeout(env: dict) -> float:
+    try:
+        return float(env.get("EVAL_TIMEOUT") or DEFAULT_TIMEOUT)
+    except ValueError:
+        raise EvaluationError(f"EVAL_TIMEOUT в .env должен быть числом секунд, сейчас {env.get('EVAL_TIMEOUT')!r}") from None
+
+
+def evaluate(record: dict, checklist: Optional[dict] = None, model_name: Optional[str] = None, *,
              opts: Optional[dict] = None, env: Optional[dict] = None,
              stats: Optional[dict] = None) -> dict:
     """Return the evaluation JSON from AGENTS.md; field `model` is the model that actually answered.
 
+    checklist: None -> chosen by the record's channel (checklist_for_channel)
     opts:  {"effort": Claude effort, "gemini_thinking": ...} (defaults in DEFAULT_OPTS)
-    env:   settings/keys (default: .env)
+    env:   settings/keys (default: .env); EVAL_MODELS, EVAL_TIMEOUT
     stats: optional dict filled with seconds, tokens, attempts, errors, warnings, params (for comparisons)
-    Raises EvaluationError if every model in the chain failed.
+    Raises ChecklistError if the checklist is invalid, EvaluationError if every model failed
+    or the time limit EVAL_TIMEOUT (default 120 s) is over.
     """
     env = llm.load_env() if env is None else env
-    opts = {**DEFAULT_OPTS, **(opts or {})}
+    if checklist is None:
+        checklist = checklist_for_channel(record.get("channel"))
+    else:
+        validate_checklist_fields(checklist)
+        scoring.validate_checklist(checklist)
+    deadline = time.monotonic() + _timeout(env)
+    opts = {**DEFAULT_OPTS, **(opts or {}), "deadline": deadline}
     stats = {} if stats is None else stats
     stats.update(model=None, seconds=0.0, input_tokens=0, output_tokens=0, cost_usd=None,
                  attempts=0, errors=[], warnings=[], params=None)
@@ -135,11 +217,18 @@ def evaluate(record: dict, checklist: dict, model_name: Optional[str] = None, *,
             stats["errors"].append({"model": name, "error": "no API key or unknown model"})
             continue
         for _ in range(ATTEMPTS_PER_MODEL):
+            if time.monotonic() >= deadline:
+                raise EvaluationError(f"превышен предел времени на оценку ({_timeout(env):.0f} с, EVAL_TIMEOUT)")
             stats["attempts"] += 1
             try:
                 res = llm.call(spec, env, system, user, schema, opts)
+            except llm.DeadlineError as e:
+                stats["errors"].append({"model": name, "error": str(e)})
+                raise EvaluationError(f"{e} ({_timeout(env):.0f} с)") from None
             except llm.LLMError as e:
                 stats["errors"].append({"model": name, "error": f"api: {e}"})
+                if not e.retryable:  # 4xx except 429: the same request will fail again -> next model
+                    break
                 continue
             stats["seconds"] += res.seconds
             stats["input_tokens"] += res.input_tokens
@@ -179,9 +268,11 @@ def main() -> None:
     record = next((r for r in records if r.get("conversation_id") == args.id), None)
     if record is None:
         sys.exit(f"conversation {args.id!r} not found in {dev}")
-    checklist = load_checklist(Path(args.checklist)) if args.checklist else checklist_for_channel(record.get("channel"))
     try:
+        checklist = load_checklist(Path(args.checklist)) if args.checklist else None  # None -> by channel
         result = evaluate(record, checklist, args.model)
+    except ChecklistError as e:
+        sys.exit(str(e))
     except EvaluationError as e:
         sys.exit(f"evaluation failed: {e}")
     print(json.dumps(result, ensure_ascii=False, indent=2))
