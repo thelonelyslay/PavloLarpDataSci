@@ -24,7 +24,7 @@
 
 ## Правила (нарушать нельзя)
 1. **Ключи и ссылка на API данных только в `.env`**. Не в коде, не в README, не в чате. Репозиторий открытый. Файл `.env` в `.gitignore`.
-2. **Данные не коммитим** (`data/` в `.gitignore`). Диалоги, записи, ответы API не попадают в Git.
+2. **Данные не коммитим** (`data/` в `.gitignore`). Диалоги, записи, ответы API не попадают в Git, в том числе в тестовые и демо-файлы (`mock_data` и т.п.). Исключение: файлы результатов для организаторов `results/<set>/results.json` коммитим (там ответы, обоснования и номера реплик, без текста диалогов).
 3. Итоговые баллы считает **код** (`src/cqa/scoring.py`), а не нейросеть. Не переписывай подсчёт, он покрыт тестами (`python -m unittest -v test_scoring`).
 4. Не вшивай критерии, веса и шкалы в код или HTML. Всё берётся из настроек чек-листа (`checklist.default.json` и сохранённые через интерфейс).
 5. Не воспроизводим заготовленные ответы. Кеш допустим только с ключом из текста диалога и версии чек-листа.
@@ -51,9 +51,13 @@
 - `GET /api/checklists`, `GET /api/checklists/{id}`, `POST /api/checklists` (сохранить новую версию), `POST /api/checklists/{id}/activate`
 - `POST /api/evaluations` `{conversation_id, checklist_id}`: запустить оценку; `GET /api/evaluations/{id}`
   Необязательное `force: true` («Переоценить» на сайте): без кэша и без переиспользования ответов, модель вызывается заново.
-- `POST /api/evaluations/batch` `{conversation_ids, checklist_id}`: пакетная оценка
-- `POST /api/evaluations/{id}/appeals` `{criterion_id, comment}`; `GET /api/appeals?status=open`
+- `POST /api/evaluations/batch` `{conversation_ids, checklist_id}`: пакетная оценка (ждёт результата)
+- `POST /api/evaluations/batch/start` (то же тело) → `{id, status, completed, failed, total, results}`; прогресс `GET /api/evaluations/batch/{job_id}`. До 4 диалогов параллельно; задача всегда заканчивается `status: "done"`, сбои считает `failed`.
+- `POST /api/checklists/{id}/recalculate`: пересчитать все диалоги канала по этой версии (фоновая задача, как выше). Если версия отличается от прежней только весами/разделами, ответы модели и принятые решения по апелляциям переиспользуются (модель не вызывается, `cost_usd` 0).
+- `POST /api/conversations`: добавить диалог (формат как в «Данные»). Коды нормализуются: `ru/kk/en` → `RU/KZ/EN`, `chat` → `agent chat`, `call` → `voice call`, `agent/manager` → `operator`, `customer` → `client`.
+- `POST /api/evaluations/{id}/appeals` `{criterion_id, comment}`; `GET /api/appeals` (все, с решениями), `?status=open|decided`
 - `POST /api/appeals/{id}/decision` `{decision: "confirm"|"change", new_answer?, reason}`
+- `GET /api/export?set=dev|prod[&only_cached=false]`: файл результатов в формате организаторов (`src/cqa/export_results.py` + проверка `validate_results.py`). Всегда по стандартным чек-листам из репозитория; по умолчанию только готовые оценки (без платных вызовов). Заголовки `X-Export-Ok`, `X-Export-Error`; при сбое 502 с последними строками лога. Для prod нужен `data/raw/prod.json` или `PROD_GROUP_ID` в `.env`.
 
 Результат оценки (JSON):
 ```
@@ -65,7 +69,7 @@
       "appeal": null | { "comment", "status", "decision", "reason" } } ] }
 ```
 Ссылка в обосновании ведёт на `message_index` (для звонка ещё на время в записи).
-Оценка в коде: `from evaluator import evaluate; evaluate(record, checklist, model_name=None)` из `src/cqa/` возвращает JSON выше; без `model_name` берётся первая модель из `EVAL_MODELS` в `.env`, при сбое следующая; поле `model` показывает, кто ответил. Ошибка всех моделей: исключение `EvaluationError`.
+Оценка в коде: `from evaluator import evaluate; evaluate(record, checklist=None, model_name=None)` из `src/cqa/` возвращает JSON выше (без чек-листа он выбирается по каналу); без `model_name` берётся первая модель из `EVAL_MODELS` в `.env`, при сбое следующая; поле `model` показывает, кто ответил. Ошибка всех моделей: исключение `EvaluationError`.
 Проверка из консоли: `python3 src/cqa/evaluator.py --id p1-ru-001 [--model ...] [--checklist путь]`. Без чек-листа он выбирается по каналу записи (`applies_to`).
 Значения `answer`: `"yes"`, `"no"`, `"na"` для да/нет и флага (у флага `"yes"` = нарушение найдено), для шкалы число-ступень (например `15`). Других значений не бывает.
 Если все применимые критерии N/A (или их веса 0), `total` и `section_scores` равны `null`, `status` = `"done"`: сервер показывает «итог не рассчитан», не считает такую оценку в средних и даёт поставить итог через апелляцию.

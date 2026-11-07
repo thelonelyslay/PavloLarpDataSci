@@ -1,3 +1,5 @@
 requests
 python-dotenv
 urllib3<2
+# server and web site (FastAPI, uvicorn)
+-r server/requirements.txt

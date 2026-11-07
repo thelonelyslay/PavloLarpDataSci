@@ -174,8 +174,7 @@ class EvidenceCheckTest(unittest.TestCase):
         self.assertIn("многоточием", reasons["consultation"])
 
 
-@unittest.skipUnless(importlib.util.find_spec("fastapi") and sys.version_info >= (3, 10),
-                     "server needs Python 3.10+ with server/requirements.txt (.venv)")
+@unittest.skipUnless(importlib.util.find_spec("fastapi"), "server dependencies are not installed (requirements.txt)")
 class ServerCacheTest(unittest.TestCase):
     """The export uses exactly the server's cache key and the model's original answers by default."""
 
@@ -273,8 +272,7 @@ class PickRowTest(unittest.TestCase):
         self.assertEqual(ex.pick_row([], "gemini-x"), (None, None))
 
 
-@unittest.skipUnless(importlib.util.find_spec("fastapi") and sys.version_info >= (3, 10),
-                     "server needs Python 3.10+ with server/requirements.txt (.venv)")
+@unittest.skipUnless(importlib.util.find_spec("fastapi"), "server dependencies are not installed (requirements.txt)")
 class RequireModelTest(unittest.TestCase):
     """A cached evaluation by another model is re-evaluated by the required one; no network (llm.call is faked)."""
 

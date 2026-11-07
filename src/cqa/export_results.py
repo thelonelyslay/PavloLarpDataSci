@@ -7,7 +7,7 @@ the server as checklist_id), even if the site has another checklist active; that
 By default the model's original answers are exported; appeals and reviewer decisions are ignored
 (--include-decisions takes the final answers after decisions).
 
-Needs the server dependencies (Python 3.10+): run with .venv/bin/python.
+Needs the server dependencies (pip install -r requirements.txt): run with .venv/bin/python.
 
   .venv/bin/python src/cqa/export_results.py --set dev --only-cached --validate
   .venv/bin/python src/cqa/export_results.py --set prod --from-file data/raw/prod.json --validate
@@ -161,7 +161,7 @@ def _server():
         import server.evaluations as evaluations
     except Exception as e:  # noqa: BLE001 - explain how to run instead of a traceback
         sys.exit(f"Не удалось загрузить код сервера ({type(e).__name__}: {e}).\n"
-                 "Запускайте через .venv/bin/python (Python 3.10+, зависимости из server/requirements.txt).")
+                 "Запускайте через .venv/bin/python после pip install -r requirements.txt.")
     app._init_db()
     return app, evaluations
 
