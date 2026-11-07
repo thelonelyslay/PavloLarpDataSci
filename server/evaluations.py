@@ -176,14 +176,14 @@ def create_evaluation(request: dict) -> dict:
     if row["applies_to"] != record["channel"]:
         raise HTTPException(status_code=422, detail="Канал чек-листа не совпадает с каналом диалога")
     cache_key = _cache_key(record, checklist, row["id"])
+    force = request.get("force") is True  # "Переоценить": skip the cache and weight-only reuse, call the model
     with _connect() as db:
-        cached = db.execute("""SELECT result_json FROM evaluations e WHERE cache_key = ? AND model != 'ERROR'
-            AND NOT EXISTS (SELECT 1 FROM appeals a WHERE a.evaluation_id = e.id)
-            ORDER BY rowid DESC LIMIT 1""",
-                            (cache_key,)).fetchone()
+        cached = None if force else db.execute("""SELECT result_json FROM evaluations e WHERE cache_key = ?
+            AND model != 'ERROR' AND NOT EXISTS (SELECT 1 FROM appeals a WHERE a.evaluation_id = e.id)
+            ORDER BY rowid DESC LIMIT 1""", (cache_key,)).fetchone()
     if cached:
         return json.loads(cached["result_json"])
-    reused = _reusable_evaluation(record, checklist, row["id"])
+    reused = None if force else _reusable_evaluation(record, checklist, row["id"])
     if reused is not None:
         # Only weights/sections changed: rescore the model's original answers, no model call, cost 0.
         original = json.loads(reused["answers_json"])

@@ -50,6 +50,7 @@
 - `GET /api/conversations/{id}`: транскрипт + аудио
 - `GET /api/checklists`, `GET /api/checklists/{id}`, `POST /api/checklists` (сохранить новую версию), `POST /api/checklists/{id}/activate`
 - `POST /api/evaluations` `{conversation_id, checklist_id}`: запустить оценку; `GET /api/evaluations/{id}`
+  Необязательное `force: true` («Переоценить» на сайте): без кэша и без переиспользования ответов, модель вызывается заново.
 - `POST /api/evaluations/batch` `{conversation_ids, checklist_id}`: пакетная оценка
 - `POST /api/evaluations/{id}/appeals` `{criterion_id, comment}`; `GET /api/appeals?status=open`
 - `POST /api/appeals/{id}/decision` `{decision: "confirm"|"change", new_answer?, reason}`

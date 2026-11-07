@@ -156,9 +156,10 @@ window.CQA_API = (function () {
     },
 
     /** POST /api/evaluations {conversation_id, checklist_id} */
-    async evaluate(conversationId, checklistId) {
+    async evaluate(conversationId, checklistId, force) {
       if (mode !== 'live') demoOnly('Оценка диалога');
       const body = { conversation_id: conversationId };
+      if (force) body.force = true; // "Переоценить": fresh model call, not the cached result
       if (checklistId) body.checklist_id = checklistId; // otherwise the server uses the channel's active checklist
       try {
         const ev = await req('POST', '/evaluations', body, EVAL_TIMEOUT_MS);

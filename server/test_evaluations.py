@@ -201,6 +201,23 @@ class WeightOnlyChangeTest(unittest.TestCase):
             self.assertEqual(model.call_count, 1)
             self.assertEqual(rescored["cost_usd"], 0.0)
 
+    def test_force_skips_cache_and_weight_reuse(self):
+        with patch.object(evaluations, "_run_engine", side_effect=self.fake_engine) as model:
+            first = evaluations.create_evaluation({"conversation_id": "w-1"})
+            self.assertEqual(evaluations.create_evaluation({"conversation_id": "w-1"})["id"], first["id"])  # cache
+            forced = evaluations.create_evaluation({"conversation_id": "w-1", "force": True})
+            self.assertEqual(model.call_count, 2)
+            self.assertNotEqual(forced["id"], first["id"])
+            self.assertEqual(evaluations.create_evaluation({"conversation_id": "w-1"})["id"], forced["id"])  # newest
+
+            def weights(ck):
+                ck["criteria"][0]["weight"] = 25
+            evaluations.create_evaluation({"conversation_id": "w-1", "checklist_id": self._new_version(weights),
+                                           "force": True})
+            self.assertEqual(model.call_count, 3)  # no weight-only reuse when forced
+            evaluations.create_evaluation({"conversation_id": "w-1", "force": "yes"})
+            self.assertEqual(model.call_count, 3)  # only a real true forces
+
     def test_changed_transcript_is_evaluated_again(self):
         with patch.object(evaluations, "_run_engine", side_effect=self.fake_engine) as model:
             evaluations.create_evaluation({"conversation_id": "w-2"})

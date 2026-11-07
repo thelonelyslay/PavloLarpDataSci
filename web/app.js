@@ -427,19 +427,19 @@
     if (!cid) return;
     if (!isLive()) { toast('Оценка работает только с сервером. Сейчас открыты демо-данные.'); return; }
     if (state.activeChecklistKey === 'draft') { toast('Выбран несохранённый черновик чек-листа. Сохраните версию во вкладке «Чек-листы» или выберите сохранённый чек-лист.'); return; }
-    await evaluateOne(cid);
+    await evaluateOne(cid, Boolean(state.evaluations[cid])); // "↻ Переоценить" forces a fresh model call
     collectAppeals();
     renderAll();
   }
 
-  async function evaluateOne(cid) {
+  async function evaluateOne(cid, force) {
     const conv = state.conversations.find(c => c.conversation_id === cid);
     if (!conv) return null;
     state.evaluating = cid;
     state.evalError = null;
     if (cid === state.activeConvId) { renderTranscriptActions(); renderEvaluationCard(); }
     try {
-      const ev = stamp(await api().evaluate(cid, checklistIdFor(conv)));
+      const ev = stamp(await api().evaluate(cid, checklistIdFor(conv), force));
       storeEval(ev);
       if (ev.status === 'error') state.evalError = { cid, message: ev.error || 'модель не ответила' };
       return ev;
