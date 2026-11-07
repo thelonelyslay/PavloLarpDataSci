@@ -19,9 +19,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+import evaluator
 import llm
 import scoring
-from prompting import ParseError, build_schema, build_system_prompt, build_user_prompt, parse_answer
+from prompting import build_schema, build_system_prompt, build_user_prompt
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKLIST = Path(__file__).resolve().parent / "checklist.default.json"
@@ -64,52 +65,32 @@ def norm_answer(v: Any) -> Any:
     return float(v) if isinstance(v, (int, float)) else v
 
 
-def evaluate_one(spec: llm.ModelSpec, env: dict, checklist: dict, system: str, schema: dict,
-                 record: dict, opts: dict) -> dict:
+def evaluate_one(spec: llm.ModelSpec, env: dict, checklist: dict, record: dict, opts: dict) -> dict:
+    """One dialog with one model (no fallback) via evaluator.evaluate + timing/tokens for the table."""
+    stats: dict = {}
     out: dict[str, Any] = {"conversation_id": record["conversation_id"], "language": record.get("language"),
-                           "channel": record.get("channel"), "seconds": 0.0, "input_tokens": 0,
-                           "output_tokens": 0, "cost_usd": None, "attempts": 0, "error": None}
-    user = build_user_prompt(record)
-    for attempt in range(2):  # 1 retry on invalid JSON / API error
-        out["attempts"] = attempt + 1
-        try:
-            res = llm.call(spec, env, system, user, schema, opts)
-        except llm.LLMError as e:
-            out["error"] = f"api: {e}"
-            continue
-        out["seconds"] += res.seconds
-        out["input_tokens"] += res.input_tokens
-        out["output_tokens"] += res.output_tokens
-        if res.cost_usd is not None:
-            out["cost_usd"] = (out["cost_usd"] or 0.0) + res.cost_usd
-        out["params"] = res.params
-        try:
-            answers, details, warnings = parse_answer(res.text, checklist, record)
-            scored = scoring.score(checklist, answers)
-        except (ParseError, ValueError) as e:
-            out["error"] = f"parse: {e}"
-            out["raw_output"] = res.text[:2000]
-            continue
-        flags = {c["id"]: c for c in checklist["criteria"] if c["type"] == "flag"}
-        criteria = []
-        for c in scored["criteria"]:
-            criteria.append({**c, **details[c["id"]]})
-        for fid, c in flags.items():
-            criteria.append({"id": fid, "title": c["title"], "section": c.get("section"),
-                             "answer": answers[fid], "applicable": True, "weight": 0,
-                             "effective_weight": 0.0, "points": 0.0, **details[fid]})
-        out.update(error=None, answers=answers, total=scored["total"], section_scores=scored["section_scores"],
-                   gross_error=scored["gross_error"], criteria=criteria, warnings=warnings)
-        out.pop("raw_output", None)
-        return out
+                           "channel": record.get("channel"), "error": None}
+    try:
+        res = evaluator.evaluate(record, checklist, spec.name, opts=opts, env=env, stats=stats)
+    except evaluator.EvaluationError as e:
+        res = None
+        out["error"] = str(e)
+        if stats.get("errors") and "raw_output" in stats["errors"][-1]:
+            out["raw_output"] = stats["errors"][-1]["raw_output"]
+    for k in ("seconds", "input_tokens", "output_tokens", "cost_usd", "attempts"):
+        out[k] = stats.get(k)
+    out["params"] = stats.get("params")
+    if res is not None:
+        out.update(evaluation_id=res["id"], answers={c["id"]: c["answer"] for c in res["criteria"]},
+                   total=res["total"], section_scores=res["section_scores"], gross_error=res["gross_error"],
+                   criteria=res["criteria"], warnings=stats.get("warnings", []))
     return out
 
 
 def run_model(spec: llm.ModelSpec, env: dict, checklist: dict, dialogs: list[dict], opts: dict) -> dict:
-    system, schema = build_system_prompt(checklist), build_schema(checklist)
     rows = []
     for rec in dialogs:
-        r = evaluate_one(spec, env, checklist, system, schema, rec, opts)
+        r = evaluate_one(spec, env, checklist, rec, opts)
         status = "ok" if not r["error"] else r["error"][:80]
         print(f"  {spec.name:<22} {rec['conversation_id']:<14} {r['seconds']:6.1f}s  {status}", flush=True)
         rows.append(r)
@@ -223,8 +204,7 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="build prompts and exit, no API calls")
     args = ap.parse_args()
 
-    checklist = json.loads(CHECKLIST.read_text(encoding="utf-8"))
-    scoring.validate_checklist(checklist)
+    checklist = evaluator.load_checklist(CHECKLIST)
     if not DEV.exists():
         sys.exit(f"{DEV} not found: run python3 src/cqa/fetch_data.py first")
     records = json.loads(DEV.read_text(encoding="utf-8"))["data"]["records"]

@@ -86,6 +86,24 @@ def available_models(env: dict) -> list[ModelSpec]:
     return specs
 
 
+def resolve_model(name: str, env: dict) -> Optional[ModelSpec]:
+    """Find a model by name: configured models first, else infer the provider from the name prefix.
+
+    Inferred models have no price (cost_usd = None) unless they are the configured GEMINI/OPENAI_MODEL.
+    Returns None if the provider's key is missing.
+    """
+    for spec in available_models(env):
+        if spec.name == name:
+            return spec
+    if name.startswith("claude-") and env.get("ANTHROPIC_API_KEY"):
+        return ModelSpec(name, "anthropic", name)
+    if name.startswith("gemini-") and env.get("GEMINI_API_KEY"):
+        return ModelSpec(name, "gemini", name)
+    if re.match(r"(gpt-|o\d|chatgpt-)", name) and env.get("OPENAI_API_KEY"):
+        return ModelSpec(name, "openai", name)
+    return None
+
+
 def missing_setup(env: dict) -> list[str]:
     """Human-readable hints about providers that are not configured."""
     hints = []
