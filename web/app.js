@@ -21,6 +21,8 @@
       status: 'all'
     },
     appeals: [],
+    evalById: {},
+    batch: null,
     isLoading: false,
     errorMessage: null
   };
@@ -71,11 +73,23 @@
     return { cls: 'ans-na', text: '—' };
   }
   function fmt2(n) { return n === null || n === undefined || isNaN(n) ? '—' : Number(n).toFixed(2); }
-  function toast(msg) { showError(msg); setTimeout(hideError, 5000); }
+  // Floating notice: red for problems, green for done
+  function toast(msg, kind) {
+    const bad = kind === 'error' || (kind === undefined && /не удалось|ошибк|не сохранен|не отправлен|^укажите|^выберите|^проверьте|только с сервером|недоступ|нет диалогов|сначала|изменений нет|не принимает/i.test(msg));
+    let box = document.getElementById('toast-box');
+    if (!box) { box = document.createElement('div'); box.id = 'toast-box'; document.body.appendChild(box); }
+    const t = document.createElement('div');
+    t.className = 'toast ' + (bad ? 'toast-bad' : 'toast-ok');
+    t.textContent = msg;
+    t.onclick = () => t.remove();
+    box.appendChild(t);
+    setTimeout(() => t.remove(), bad ? 7000 : 4500);
+  }
 
   // --- INITIALIZATION ---
   async function init() {
     bindEvents();
+    restoreUiState();
     await loadData();
   }
 
@@ -96,7 +110,8 @@
       } catch (e) { /* no draft */ }
       if (!state.checklists[state.activeChecklistKey]) {
         const keys = Object.keys(state.checklists).filter(k => k !== 'draft');
-        state.activeChecklistKey = keys.find(k => (state.checklists[k].applies_to || 'agent chat') === 'agent chat') || keys[0] || 'draft';
+        state.activeChecklistKey = keys.find(k => state.checklists[k].active && (state.checklists[k].applies_to || 'agent chat') === 'agent chat')
+          || keys.find(k => (state.checklists[k].applies_to || 'agent chat') === 'agent chat') || keys[0] || 'draft';
       }
       renderChecklistPicker();
 
@@ -105,6 +120,7 @@
         state.activeConvId = state.conversations[0].conversation_id;
       }
       if (state.activeConvId) await selectConversation(state.activeConvId, true);
+      if (isLive()) { await preloadEvaluations(); resumeJob(); loadTranscriptsInBackground(); }
 
       collectAppeals();
       renderAll();
@@ -117,21 +133,80 @@
     }
   }
 
+  // Live mode: fill totals, gross-error reasons and appeals. One GET /api/evaluations (newest 100),
+  // then the latest evaluation of every conversation (last_evaluation_id) and the evaluations behind open appeals.
+  async function preloadEvaluations() {
+    try {
+      const recent = await api().getRecentEvaluations();
+      recent.slice().reverse().forEach(ev => { if (ev && ev.id) state.evalById[ev.id] = stamp(ev); });
+    } catch (e) { /* older server: no list */ }
+    const want = new Set();
+    state.conversations.forEach(c => { if (c.last_evaluation_id && !state.evalById[c.last_evaluation_id]) want.add(c.last_evaluation_id); });
+    for (const st of ['open', 'decided']) {
+      try {
+        const list = await api().getAppeals(st);
+        (Array.isArray(list) ? list : []).forEach(a => { if (!state.evalById[a.evaluation_id]) want.add(a.evaluation_id); });
+      } catch (e) { /* appeals list unavailable */ }
+    }
+    const ids = [...want];
+    for (let i = 0; i < ids.length; i += 6) {
+      await Promise.all(ids.slice(i, i + 6).map(async id => {
+        try { const ev = await api().getEvaluation(id); if (ev) state.evalById[ev.id] = ev; } catch (e) { /* skip */ }
+      }));
+    }
+    // the conversation's latest evaluation is the one the server names; otherwise the newest we know
+    state.conversations.forEach(c => {
+      const ev = (c.last_evaluation_id && state.evalById[c.last_evaluation_id])
+        || Object.values(state.evalById).filter(e => e.conversation_id === c.conversation_id).sort((x, y) => (y._seq || 0) - (x._seq || 0))[0];
+      if (ev) { state.evaluations[c.conversation_id] = ev; syncConvFromEval(c, ev); }
+    });
+  }
+
+  // The server list has no texts: fetch transcripts quietly for previews and text search
+  async function loadTranscriptsInBackground() {
+    const todo = state.conversations.filter(c => !c.transcript);
+    for (let i = 0; i < todo.length; i += 6) {
+      await Promise.all(todo.slice(i, i + 6).map(async c => {
+        try { const full = await api().getConversation(c.conversation_id); c.transcript = full.transcript; c.audio_url = full.audio_url; } catch (e) { /* skip */ }
+      }));
+      renderConversationsList();
+    }
+  }
+
   async function ensureEvaluationLoaded(cid, force) {
     if (state.evaluations[cid] && !force) return;
     const conv = state.conversations.find(c => c.conversation_id === cid);
     if (!conv) return;
     try {
       const ev = await api().getLatestEvaluation(conv);
-      if (ev) { state.evaluations[cid] = ev; syncConvFromEval(conv, ev); }
+      if (ev) storeEval(ev);
       else delete state.evaluations[cid];
     } catch (e) {
       console.warn('Не удалось загрузить оценку для', cid, e);
     }
   }
 
+  function storeEval(ev) {
+    if (!ev || !ev.id) return;
+    state.evalById[ev.id] = ev;
+    const cur = state.evaluations[ev.conversation_id];
+    if (!cur || cur.id === ev.id || !state.evalById[cur.id] || (ev._seq || 0) >= (cur._seq || 0)) state.evaluations[ev.conversation_id] = ev;
+    const conv = state.conversations.find(c => c.conversation_id === ev.conversation_id);
+    if (conv && state.evaluations[ev.conversation_id] === ev) syncConvFromEval(conv, ev);
+  }
+  let evalSeq = 0;
+  const stamp = ev => { if (ev) ev._seq = ++evalSeq; return ev; };
+
+  // Checklist to use for a conversation: the picked one if it is for this channel, otherwise the server's active one
+  function checklistIdFor(conv) {
+    const cl = activeChecklist();
+    if (state.activeChecklistKey === 'draft' || !cl || !cl.id) return null;
+    return (cl.applies_to || 'agent chat') === conv.channel ? cl.id : null;
+  }
+
   function syncConvFromEval(conv, ev) {
     conv.total_score = ev.total;
+    conv.evaluation_status = ev.status;
     conv.gross_error = Boolean(ev.gross_error);
     conv.last_evaluation_id = ev.id;
     conv.has_appeal = (ev.criteria || []).some(c => c.appeal && c.appeal.status === 'open');
@@ -142,7 +217,7 @@
     if (!sel) return;
     sel.innerHTML = Object.entries(state.checklists).map(([k, c]) => {
       const n = (c.criteria || []).length;
-      const label = k === 'draft' ? `Черновик (не сохранён): ${c.name || ''}` : `${c.name || k} v${c.version || 1}`;
+      const label = k === 'draft' ? `Черновик (не сохранён): ${c.name || ''}` : `${c.active ? '★ ' : ''}${c.name || k} v${c.version || 1}`;
       return `<option value="${escapeHtml(k)}" ${k === state.activeChecklistKey ? 'selected' : ''}>${escapeHtml(label)} · ${n} крит.</option>`;
     }).join('');
   }
@@ -183,23 +258,25 @@
 
   function collectAppeals() {
     state.appeals = [];
-    for (const cid in state.evaluations) {
-      const ev = state.evaluations[cid];
-      if (ev && ev.criteria) {
-        for (const crit of ev.criteria) {
-          if (crit.appeal) {
-            state.appeals.push({
-              conversation_id: cid,
-              criterion_id: crit.id,
-              criterion_title: crit.title,
-              answer: finalAnswer(crit),
-              view: answerView(critDef(ev, crit.id), crit),
-              appeal: crit.appeal
-            });
-          }
-        }
+    const evs = Object.values(state.evalById).length ? Object.values(state.evalById) : Object.values(state.evaluations);
+    const seen = new Set();
+    for (const ev of evs) {
+      if (!ev || !ev.criteria || seen.has(ev.id)) continue;
+      seen.add(ev.id);
+      for (const crit of ev.criteria) {
+        if (!crit.appeal) continue;
+        state.appeals.push({
+          evaluation_id: ev.id,
+          conversation_id: ev.conversation_id,
+          criterion_id: crit.id,
+          criterion_title: crit.title,
+          answer: finalAnswer(crit),
+          view: answerView(critDef(ev, crit.id), crit),
+          appeal: crit.appeal
+        });
       }
     }
+    state.appeals.sort((x, y) => (x.appeal.status === 'open' ? 0 : 1) - (y.appeal.status === 'open' ? 0 : 1));
     updateAppealsBadge();
   }
 
@@ -222,12 +299,8 @@
     renderAnalyticsDashboard();
   }
 
-  // 1. CONVERSATIONS SIDEBAR
-  function renderConversationsList() {
-    const listEl = document.getElementById('conversations-list');
-    if (!listEl) return;
-
-    let items = state.conversations.filter(conv => {
+  function visibleConversations() {
+    return state.conversations.filter(conv => {
       if (state.filters.channel === 'chat' && conv.channel !== 'agent chat') return false;
       if (state.filters.channel === 'voice' && conv.channel !== 'voice call') return false;
       if (state.filters.lang !== 'all' && conv.language !== state.filters.lang) return false;
@@ -241,6 +314,23 @@
       }
       return true;
     });
+  }
+
+  // Why a conversation is flagged: the explanation of the triggered flag criterion
+  function grossReason(cid) {
+    const ev = state.evaluations[cid];
+    if (!ev || !ev.gross_error) return '';
+    const c = (ev.criteria || []).find(x => { const d = critDef(ev, x.id); return d && d.type === 'flag' && finalAnswer(x) === 'yes'; });
+    return c ? c.explanation || c.title : 'Отмечена грубая ошибка';
+  }
+
+  // 1. CONVERSATIONS SIDEBAR
+  function renderConversationsList() {
+    const listEl = document.getElementById('conversations-list');
+    if (!listEl) return;
+
+    renderBatchBar();
+    const items = visibleConversations();
 
     listEl.innerHTML = '';
     if (items.length === 0) {
@@ -257,7 +347,7 @@
       const firstClientMsg = (conv.transcript && conv.transcript.find(m => m.speaker === 'client')) || (conv.transcript && conv.transcript[0]);
       const snippet = firstClientMsg ? firstClientMsg.text : '';
 
-      const lvl = scoreLevel(conv.total_score);
+      const lvl = conv.evaluation_status === 'error' ? 'low' : scoreLevel(conv.total_score);
       const scoreClass = { excellent: 'score-perfect', good: 'score-good', low: 'score-poor', none: 'score-fair' }[lvl];
 
       card.innerHTML = `
@@ -269,12 +359,16 @@
           </div>
         </div>
         <div class="conv-snippet">${escapeHtml(snippet)}</div>
+        ${conv.gross_error && grossReason(conv.conversation_id) ? `<div class="gross-reason">⚠️ ${escapeHtml(grossReason(conv.conversation_id))}</div>` : ''}
         <div class="conv-card-bottom">
           <span class="score-pill ${scoreClass}">
-            ★ ${conv.total_score !== null && conv.total_score !== undefined ? fmt2(conv.total_score) : (conv.last_evaluation_id ? 'итог не рассчитан' : 'не оценён')}
+            ${conv.evaluation_status === 'error' ? '✕ ошибка оценки'
+              : '★ ' + (conv.total_score !== null && conv.total_score !== undefined ? fmtShort(conv.total_score) : (conv.last_evaluation_id ? 'итог не рассчитан' : 'не оценён'))}
           </span>
           <div style="display: flex; gap: 6px;">
-            ${conv.gross_error ? '<span class="alert-icon-pill" title="Грубая ошибка!">⚠️ Нарушение</span>' : ''}
+            ${state.evaluating === conv.conversation_id ? '<span class="busy-pill">⏳ оценка…</span>' : ''}
+            ${state.evalError && state.evalError.cid === conv.conversation_id ? '<span class="err-pill" title="' + escapeHtml(state.evalError.message) + '">ошибка</span>' : ''}
+            ${conv.gross_error ? '<span class="alert-icon-pill" title="Грубая ошибка">⚠️ Нарушение</span>' : ''}
             ${conv.has_appeal ? '<span style="font-size: 11px; color: var(--warning); font-weight: 700;" title="Подана апелляция">⚖️ Апелляция</span>' : ''}
           </div>
         </div>
@@ -286,6 +380,7 @@
   async function selectConversation(cid, quiet) {
     if (state.activeConvId !== cid) state.selCrit = null;
     state.activeConvId = cid;
+    writeHash();
     if (!quiet) renderConversationsList();
 
     let conv = state.conversations.find(c => c.conversation_id === cid);
@@ -308,25 +403,119 @@
   // Evaluate the active conversation on the server: POST /api/evaluations
   async function evaluateActive() {
     const cid = state.activeConvId;
-    const cl = activeChecklist();
-    if (!cid || !cl) return;
-    if (!isLive()) { toast('Оценка работает только с сервером. Сейчас открыты демо-данные — подключите сервер (кнопка статуса справа сверху).'); return; }
-    if (state.activeChecklistKey === 'draft') { toast('Чек-лист — несохранённый черновик. Сначала нажмите «Сохранить и применить» во вкладке чек-листа.'); return; }
+    if (!cid) return;
+    if (!isLive()) { toast('Оценка работает только с сервером. Сейчас открыты демо-данные.'); return; }
+    if (state.activeChecklistKey === 'draft') { toast('Выбран несохранённый черновик чек-листа. Сохраните версию во вкладке «Чек-листы» или выберите сохранённый чек-лист.'); return; }
+    await evaluateOne(cid);
+    collectAppeals();
+    renderAll();
+  }
+
+  async function evaluateOne(cid) {
+    const conv = state.conversations.find(c => c.conversation_id === cid);
+    if (!conv) return null;
     state.evaluating = cid;
-    renderTranscriptActions();
+    state.evalError = null;
+    if (cid === state.activeConvId) { renderTranscriptActions(); renderEvaluationCard(); }
     try {
-      const ev = await api().evaluate(cid, cl.id || state.activeChecklistKey);
-      state.evaluations[cid] = ev;
-      const conv = state.conversations.find(c => c.conversation_id === cid);
-      if (conv) syncConvFromEval(conv, ev);
-      if (ev.status === 'error') toast('Оценка завершилась ошибкой: ' + (ev.error || 'см. сервер'));
+      const ev = stamp(await api().evaluate(cid, checklistIdFor(conv)));
+      storeEval(ev);
+      if (ev.status === 'error') state.evalError = { cid, message: ev.error || 'модель не ответила' };
+      return ev;
     } catch (e) {
-      toast('Не удалось оценить диалог: ' + e.message);
+      state.evalError = { cid, message: e.message };
+      return null;
     } finally {
       state.evaluating = null;
-      collectAppeals();
-      renderAll();
     }
+  }
+
+  // "Оценить все": background job on the server (POST /api/evaluations/batch/start), progress by polling
+  const JOB_KEY = 'cqa_batch_job';
+  async function evaluateAll(ids, label) {
+    if (!isLive()) { toast('Пакетная оценка работает только с сервером.'); return; }
+    if (state.batch) { toast('Пакетная оценка уже идёт'); return; }
+    if (!ids.length) { toast('Нет диалогов для оценки'); return; }
+    // one checklist for the whole job only if every conversation is of the picked checklist's channel
+    const convs = ids.map(id => state.conversations.find(c => c.conversation_id === id)).filter(Boolean);
+    const clIds = [...new Set(convs.map(c => checklistIdFor(c)))];
+    const checklistId = clIds.length === 1 ? clIds[0] : null;
+    try {
+      const job = await api().startBatch(ids, checklistId);
+      await followJob(job, label || 'Оценка');
+    } catch (e) {
+      toast('Не удалось запустить пакетную оценку: ' + e.message);
+    }
+  }
+
+  async function followJob(job, label) {
+    state.batch = { id: job.id, total: job.total || 0, done: job.completed || 0, errors: 0, label, seen: 0 };
+    try { localStorage.setItem(JOB_KEY, JSON.stringify({ id: job.id, label })); } catch (e) { /* storage off */ }
+    renderBatchBar();
+    let cur = job;
+    while (true) {
+      const fresh = (cur.results || []).slice(state.batch.seen);
+      state.batch.seen += fresh.length;
+      for (const r of fresh) {
+        if (r.evaluation && r.evaluation.id) { storeEval(stamp(r.evaluation)); if (r.evaluation.status === 'error') state.batch.errors++; }
+        else { state.batch.errors++; if (r.conversation_id === state.activeConvId) state.evalError = { cid: r.conversation_id, message: r.error || 'ошибка оценки' }; }
+        const conv = state.conversations.find(c => c.conversation_id === r.conversation_id);
+        if (conv && !r.evaluation) conv.evaluation_status = 'error';
+      }
+      state.batch.done = cur.completed || state.batch.seen;
+      state.batch.total = cur.total || state.batch.total;
+      renderBatchBar();
+      if (fresh.length) {
+        renderConversationsList();
+        if (fresh.some(r => r.conversation_id === state.activeConvId)) { renderTranscript(); renderEvaluationCard(); }
+      }
+      if (cur.status === 'done') break;
+      await new Promise(r => setTimeout(r, 1500));
+      try { cur = await api().getBatch(state.batch.id); }
+      catch (e) {
+        if (e.status === 404) { toast('Пакетная задача не найдена на сервере (сервер перезапускали?)'); break; }
+        await new Promise(r => setTimeout(r, 3000)); // network hiccup: keep polling
+      }
+    }
+    const b = state.batch;
+    state.batch = null;
+    try { localStorage.removeItem(JOB_KEY); } catch (e) { /* storage off */ }
+    collectAppeals();
+    renderAll();
+    toast(`${b.label}: готово ${b.done - b.errors} из ${b.total}${b.errors ? `, ошибок: ${b.errors}` : ''}`, b.errors ? 'error' : 'ok');
+  }
+
+  // After a page reload: continue showing a job that is still running on the server
+  async function resumeJob() {
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(JOB_KEY) || 'null'); } catch (e) { /* storage off */ }
+    if (!saved || !saved.id || state.batch) return;
+    try { const job = await api().getBatch(saved.id); followJob(job, saved.label || 'Оценка'); }
+    catch (e) { try { localStorage.removeItem(JOB_KEY); } catch (x) { /* storage off */ } }
+  }
+
+  function renderBatchBar() {
+    const g = document.getElementById('global-progress');
+    if (g) {
+      const b = state.batch;
+      g.style.display = b ? 'block' : 'none';
+      if (b) g.innerHTML = `<div class="gp-text">⏳ ${escapeHtml(b.label)}: ${b.done} / ${b.total}${b.errors ? ` · ошибок ${b.errors}` : ''}</div>
+        <div class="gp-track"><div class="gp-fill" style="width:${b.total ? b.done / b.total * 100 : 0}%"></div></div>`;
+    }
+    const box = document.getElementById('batch-bar');
+    if (!box) return;
+    const b = state.batch;
+    if (!b) {
+      box.innerHTML = `<button class="btn-primary batch-btn" id="btn-evaluate-all" ${isLive() ? '' : 'disabled title="Только с сервером"'}>▶ Оценить все (${visibleConversations().length})</button>`;
+      const btn = document.getElementById('btn-evaluate-all');
+      if (btn) btn.onclick = () => evaluateAll(visibleConversations().map(c => c.conversation_id), 'Оценка');
+      return;
+    }
+    box.innerHTML = `<div class="batch-progress" id="batch-progress">
+        <div class="batch-text"><b>${escapeHtml(b.label)}: ${b.done} / ${b.total}</b>${b.errors ? ` · ошибок ${b.errors}` : ''}</div>
+        <div class="bar-track"><div class="bar-fill" style="width:${b.total ? b.done / b.total * 100 : 0}%"></div></div>
+        <div class="batch-hint">Идёт на сервере; можно открывать диалоги и перезагружать страницу.</div>
+      </div>`;
   }
 
   function renderTranscriptActions() {
@@ -365,6 +554,8 @@
     }
     if (titleEl) titleEl.innerHTML = '';
     document.body.classList.toggle('is-chat', !isVoice);
+    const tlCard = document.querySelector('.timeline-card');
+    if (tlCard) tlCard.style.display = isVoice ? '' : 'none';
 
     // Player: real audio for calls; for chats only the timeline
     const audio = document.getElementById('html5-audio-element');
@@ -572,6 +763,22 @@
     const criteriaContainer = document.getElementById('criteria-container');
     const demoTag = document.getElementById('eval-demo-tag');
 
+    const busy = state.evaluating === state.activeConvId;
+    const err = state.evalError && state.evalError.cid === state.activeConvId && (!ev || ev.status === 'error') ? state.evalError.message : null;
+    if (busy || (!ev && err)) {
+      if (totalEl) totalEl.textContent = busy ? '…' : '—';
+      if (badgeEl) { badgeEl.className = 'score-label-badge ' + (busy ? 'badge-good' : 'badge-violation'); badgeEl.textContent = busy ? 'Оцениваем' : 'Ошибка оценки'; }
+      if (grossBanner) grossBanner.style.display = 'none';
+      if (sectionsSummary) sectionsSummary.innerHTML = '';
+      renderQualitySummary(null);
+      const whyT = document.getElementById('why-title'); const whyX = document.getElementById('why-text');
+      if (whyT) whyT.textContent = busy ? 'Идёт оценка' : 'Ошибка оценки';
+      if (whyX) whyX.textContent = busy ? 'Сервер вызывает модель и считает баллы через scoring.py. Обычно 10–60 секунд.' : err;
+      if (criteriaContainer) criteriaContainer.innerHTML = busy
+        ? '<div class="empty-eval"><div class="spinner"></div>Оцениваем диалог…</div>'
+        : `<div class="empty-eval err">Не удалось оценить: ${escapeHtml(err)}<br>Нажмите «↻ Переоценить», чтобы повторить.</div>`;
+      return;
+    }
     if (!ev) {
       if (totalEl) totalEl.textContent = '—';
       if (badgeEl) { badgeEl.className = 'score-label-badge badge-warning'; badgeEl.textContent = 'Не оценён'; }
@@ -611,7 +818,7 @@
     if (origEl) {
       const changed = ev.original_total !== undefined && ev.original_total !== null && ev.original_total !== ev.total;
       origEl.style.display = changed ? 'inline' : 'none';
-      origEl.textContent = changed ? `исходно ${fmt2(ev.original_total)}` : '';
+      origEl.textContent = changed ? `исходно ${fmtShort(ev.original_total)}` : '';
     }
 
     if (grossBanner) {
@@ -649,7 +856,10 @@
     if (!criteriaContainer) return;
     criteriaContainer.innerHTML = '';
     if (ev.status === 'error') {
-      criteriaContainer.innerHTML = `<div class="empty-eval">Сервер не смог оценить диалог: ${escapeHtml(ev.error || ev.message || 'неизвестная ошибка')}.<br>Нажмите «↻ Переоценить».</div>`;
+      criteriaContainer.innerHTML = `<div class="empty-eval err">Сервер не смог оценить диалог: ${escapeHtml(ev.error || ev.message || 'неизвестная ошибка')}.<br>Нажмите «↻ Переоценить».</div>`;
+      const whyT = document.getElementById('why-title'); const whyX = document.getElementById('why-text');
+      if (whyT) whyT.textContent = 'Ошибка оценки';
+      if (whyX) whyX.textContent = ev.error || 'Модель не ответила';
       return;
     }
     const transcript = (state.conversations.find(c => c.conversation_id === state.activeConvId) || {}).transcript || [];
@@ -693,12 +903,12 @@
           <div style="font-size: 11px; background: #fffbeb; border: 1px solid #fde68a; border-radius: 6px; padding: 6px 8px; width: 100%;">
             <div style="display: flex; justify-content: space-between; align-items: center;">
               <span class="appeal-status-badge">⚖️ ${open ? 'На апелляции' : 'Рассмотрено'}</span>
-              ${open ? `<button class="btn-primary" style="padding: 2px 8px; font-size: 11px;" onclick="app.openReviewModal('${escapeHtml(state.activeConvId)}', '${escapeHtml(crit.id)}')">Рассмотреть</button>` : ''}
+              ${open ? `<button class="btn-primary" style="padding: 2px 8px; font-size: 11px;" onclick="app.openReviewModal('${escapeHtml(ev.id)}', '${escapeHtml(crit.id)}')">Рассмотреть</button>` : ''}
             </div>
             <div style="margin-top: 4px; color: #92400e;"><strong>Апелляция:</strong> ${escapeHtml(crit.appeal.comment)}</div>
             ${crit.appeal.decision ? `
               <div style="margin-top: 4px; color: #065f46; border-top: 1px dashed #d1fae5; padding-top: 4px;">
-                <strong>Решение:</strong> ${crit.appeal.decision === 'change' ? 'оценка изменена' : 'оценка подтверждена'}. Причина: ${escapeHtml(crit.appeal.reason || '—')}
+                <strong>Решение:</strong> ${crit.appeal.decision === 'change' ? 'апелляция принята, оценка изменена' : 'апелляция отклонена, оценка оставлена'}. Причина: ${escapeHtml(crit.appeal.reason || '—')}
               </div>` : ''}
           </div>`;
       } else {
@@ -724,7 +934,7 @@
           </div>
         </div>
         <div class="weights-row">${weightsHtml}</div>
-        <div class="criterion-explanation">${escapeHtml(crit.explanation || '—')}</div>
+        <div class="criterion-explanation">${crit.appeal && crit.appeal.status !== 'open' && crit.appeal.decision ? '<span class="expl-label">Модель:</span> ' : ''}${escapeHtml(crit.explanation || '—')}</div>
         ${rulesHtml}
         ${naHtml}
         ${evidenceHtml}
@@ -748,7 +958,10 @@
     if (!crit) return null;
     const idx = (crit.evidence || []).map(e => Number(e.message_index)).filter(n => !isNaN(n));
     if (idx.length) return [Math.min(...idx), Math.max(...idx)];
-    if (Array.isArray(crit.checked_range) && crit.checked_range.length === 2) return [Number(crit.checked_range[0]), Number(crit.checked_range[1])];
+    // the checked range only matters when the action was missing (no/partial/flag), not for passed or N/A criteria
+    const ev = state.evaluations[state.activeConvId];
+    const stt = ev ? critStatus(critDef(ev, crit.id), crit) : 'bad';
+    if (['bad', 'part', 'flag'].includes(stt) && Array.isArray(crit.checked_range) && crit.checked_range.length === 2) return [Number(crit.checked_range[0]), Number(crit.checked_range[1])];
     return null;
   }
   function selectedCrit() {
@@ -774,8 +987,9 @@
     const crits = ev.criteria || [];
     // default selection: the first criterion that lost points (or a gross error flag)
     if (!crits.find(c => c.id === state.selCrit)) {
-      const lost = crits.find(c => ['flag', 'bad', 'part'].includes(critStatus(critDef(ev, c.id), c)));
-      state.selCrit = (lost || crits[0] || {}).id || null;
+      const st = c => critStatus(critDef(ev, c.id), c);
+      const pick = crits.find(c => st(c) === 'flag') || crits.find(c => ['bad', 'part'].includes(st(c)));
+      state.selCrit = pick ? pick.id : null; // nothing lost: no criterion is preselected
     }
     const ICON = { ok: '✓', part: '≈', bad: '✕', na: 'N/A', flag: '!' };
     if (list) {
@@ -824,8 +1038,8 @@
     const go = document.getElementById('btn-goto-fragment');
     const dis = document.getElementById('btn-dispute');
     if (!ev || !crit) {
-      if (whyT) whyT.textContent = 'Почему снижена оценка';
-      if (whyX) whyX.textContent = ev ? '—' : 'Диалог ещё не оценён.';
+      if (whyT) whyT.textContent = ev ? 'Оценка не снижена' : 'Почему снижена оценка';
+      if (whyX) whyX.textContent = ev ? 'Все применимые критерии выполнены. Нажмите на критерий, чтобы увидеть обоснование и реплики.' : 'Диалог ещё не оценён.';
       if (go) go.disabled = true;
       if (dis) dis.disabled = true;
       return;
@@ -833,10 +1047,20 @@
     const def = critDef(ev, crit.id);
     const st = critStatus(def, crit);
     const lostAny = (ev.criteria || []).some(c => ['bad', 'part', 'flag'].includes(critStatus(critDef(ev, c.id), c)));
-    if (whyT) whyT.textContent = st === 'ok' ? (lostAny ? 'Критерий выполнен' : 'Оценка не снижена') : st === 'na' ? 'Почему N/A' : st === 'flag' ? 'Грубая ошибка' : 'Почему снижена оценка';
-    if (whyX) {
-      const extra = st === 'na' ? (crit.na_reason || (def && def.na_condition) || '') : '';
-      whyX.innerHTML = `<span class="why-crit">${escapeHtml(crit.title)}:</span> ${escapeHtml(extra || crit.explanation || '—')}`;
+    const decided = crit.appeal && crit.appeal.status !== 'open' && crit.appeal.decision;
+    if (decided) {
+      // After the reviewer's decision the reviewer's reason replaces the model's explanation
+      const accepted = crit.appeal.decision === 'change';
+      const orig = crit.original_answer !== undefined && crit.original_answer !== null ? crit.original_answer : crit.answer;
+      if (whyT) whyT.textContent = accepted ? 'Решение проверяющего: оценка изменена' : 'Решение проверяющего: оценка оставлена';
+      if (whyX) whyX.innerHTML = `<span class="why-crit">${escapeHtml(crit.title)}:</span> ${escapeHtml(crit.appeal.reason || '—')}`
+        + (accepted ? `<div class="why-sub">Было: ${answerView(def, crit, orig).text} → стало: ${answerView(def, crit).text}</div>` : '');
+    } else {
+      if (whyT) whyT.textContent = st === 'ok' ? (lostAny ? 'Критерий выполнен' : 'Оценка не снижена') : st === 'na' ? 'Почему N/A' : st === 'flag' ? 'Грубая ошибка' : 'Почему снижена оценка';
+      if (whyX) {
+        const extra = st === 'na' ? (crit.na_reason || (def && def.na_condition) || '') : '';
+        whyX.innerHTML = `<span class="why-crit">${escapeHtml(crit.title)}:</span> ${escapeHtml(extra || crit.explanation || '—')}`;
+      }
     }
     if (go) { go.disabled = !range; go.onclick = () => range && scrollToReplica(range[0], range[1]); }
     if (dis) {
@@ -855,28 +1079,36 @@
 
     tbody.innerHTML = '';
     if (state.appeals.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">Нет активных апелляций</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">Апелляций пока нет. Оспорить оценку можно в карточке диалога: кнопка «Оспорить оценку».</td></tr>';
       return;
     }
 
     state.appeals.forEach(item => {
       const tr = document.createElement('tr');
       const isPending = item.appeal.status === 'open';
+      const ev = state.evalById[item.evaluation_id] || {};
+      const crit = (ev.criteria || []).find(c => c.id === item.criterion_id) || {};
+      const def = critDef(ev, item.criterion_id);
+      const orig = crit.original_answer !== undefined && crit.original_answer !== null ? crit.original_answer : crit.answer;
+      const accepted = item.appeal.decision === 'change';
       tr.innerHTML = `
         <td><a href="javascript:void(0)" onclick="app.selectConversationAndTab('${escapeHtml(item.conversation_id)}')" style="font-weight: 700; color: var(--primary); text-decoration: none;">${escapeHtml(item.conversation_id)}</a></td>
         <td><strong>${escapeHtml(item.criterion_title)}</strong></td>
         <td><span class="ans-badge ${item.view.cls}">${item.view.text}</span></td>
         <td style="max-width: 320px;">${escapeHtml(item.appeal.comment)}</td>
         <td>
-          <span class="badge ${isPending ? 'score-fair' : 'score-perfect'}">${isPending ? 'На рассмотрении' : 'Завершено'}</span>
+          <span class="badge ${isPending ? 'score-fair' : 'score-perfect'}">${isPending ? 'На рассмотрении' : 'Решено'}</span>
         </td>
         <td>
           ${isPending ? `
-            <button class="btn-primary" style="padding: 4px 10px; font-size: 11px;" onclick="app.openReviewModal('${escapeHtml(item.conversation_id)}', '${escapeHtml(item.criterion_id)}')">
+            <button class="btn-primary" style="padding: 4px 10px; font-size: 11px;" onclick="app.openReviewModal('${escapeHtml(item.evaluation_id)}', '${escapeHtml(item.criterion_id)}')">
               Принять решение
             </button>
           ` : `
-            <span style="font-size: 11px; color: var(--text-muted);">Решение принято</span>
+            <div class="ap-decision ${accepted ? 'acc' : 'rej'}">${accepted ? 'Принята' : 'Отклонена'}${accepted ? `: ${answerView(def, crit, orig).text} → ${answerView(def, crit).text}` : ''}</div>
+            ${accepted && ev.original_total !== ev.total ? `<div class="ap-total">Итог ${fmtShort(ev.original_total)} → <b>${fmtShort(ev.total)}</b></div>` : ''}
+            <div class="ap-reason">${escapeHtml(item.appeal.reason || '')}</div>
+            <button class="chip-btn" onclick="app.openReviewModal('${escapeHtml(item.evaluation_id)}', '${escapeHtml(item.criterion_id)}')">Открыть</button>
           `}
         </td>
       `;
@@ -891,6 +1123,7 @@
     const channelSelect = document.getElementById('checklist-channel-select');
     if (!tbody) return;
 
+    renderChecklistActions();
     const checklist = activeChecklist();
     if (!checklist || !checklist.criteria) { tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:24px;color:var(--text-muted)">Чек-листы не загружены</td></tr>'; return; }
 
@@ -911,13 +1144,28 @@
         indicatorEl.innerHTML = '✓ Сумма весов: <strong>100 / 100</strong> (Сбалансировано)';
       } else {
         indicatorEl.className = 'weight-indicator-badge weight-indicator-warn';
-        indicatorEl.innerHTML = `⚠️ Внимание: Сумма базовых весов равна <strong>${sumWeights} / 100</strong>! (Рекомендуется 100)`;
+        indicatorEl.innerHTML = `Сумма весов: <strong>${sumWeights}</strong> — итог всё равно приводится к 100 (вес × 100 / сумма применимых)`;
       }
     }
 
     tbody.innerHTML = '';
+    // Draft: mark new / changed criteria against the version it is based on
+    const base = state.activeChecklistKey === 'draft' ? state.checklists[checklist.based_on] : null;
+    const FIELDS = { title: 'название', section: 'секция', type: 'тип', weight: 'вес', allow_na: 'N/A', na_condition: 'условие N/A', steps: 'шкала', instruction: 'инструкция', rules: 'правила' };
+    const diffOf = crit => {
+      if (!base) return null;
+      const old = (base.criteria || []).find(c => c.id === crit.id);
+      if (!old) return { isNew: true };
+      const changed = Object.keys(FIELDS).filter(k => JSON.stringify(old[k] ?? null) !== JSON.stringify(crit[k] ?? null));
+      return changed.length ? { changed, old } : null;
+    };
     checklist.criteria.forEach((crit, idx) => {
       const tr = document.createElement('tr');
+      const diff = diffOf(crit);
+      if (diff) tr.className = diff.isNew ? 'row-new' : 'row-changed';
+      const diffBadge = !diff ? '' : diff.isNew ? '<span class="diff-badge new">новый</span>'
+        : `<span class="diff-badge chg" title="${escapeHtml(diff.changed.map(k => FIELDS[k]).join(', '))}">изменён: ${escapeHtml(diff.changed.map(k => FIELDS[k]).join(', '))}</span>`;
+      const weightCell = diff && !diff.isNew && diff.changed.includes('weight') ? `<span class="old-val">${diff.old.weight}</span> → <strong>${crit.weight}</strong>` : `<strong>${crit.weight}</strong>`;
       let typeLabel = 'Да / Нет';
       if (crit.type === 'scale') typeLabel = `Шкала [${(crit.steps || []).join(', ')}]`;
       else if (crit.type === 'flag') typeLabel = 'Флаг (Грубая ошибка)';
@@ -925,9 +1173,9 @@
       tr.innerHTML = `
         <td>${idx + 1}</td>
         <td><span class="badge badge-chat">${escapeHtml(crit.section || '—')}</span></td>
-        <td><strong>${escapeHtml(crit.title)}</strong>${crit.instruction ? `<div style="font-size:11px;color:var(--text-muted);margin-top:3px">${escapeHtml(crit.instruction)}</div>` : ''}</td>
+        <td><strong>${escapeHtml(crit.title)}</strong> ${diffBadge}${crit.instruction ? `<div style="font-size:11px;color:var(--text-muted);margin-top:3px">${escapeHtml(crit.instruction)}</div>` : ''}</td>
         <td>${typeLabel}${crit.allow_na && crit.na_condition ? `<div style="font-size:11px;color:var(--text-muted);margin-top:3px">${escapeHtml(crit.na_condition)}</div>` : ''}</td>
-        <td><strong>${crit.weight}</strong></td>
+        <td>${crit.type === 'flag' ? '—' : weightCell}</td>
         <td>${crit.allow_na ? '<span style="color: var(--success); font-weight: 700;">✓ Да</span>' : '<span style="color: var(--text-muted);">— Нет</span>'}</td>
         <td style="max-width: 280px; font-size: 12px; color: #334155;">
           ${crit.rules ? `<div class="rules-box" style="margin: 0;">${escapeHtml(crit.rules)}</div>` : '<span style="color: var(--text-muted);">—</span>'}
@@ -941,6 +1189,15 @@
       `;
       tbody.appendChild(tr);
     });
+    if (base) {
+      const removed = (base.criteria || []).filter(c => !checklist.criteria.find(x => x.id === c.id));
+      if (removed.length) {
+        const tr = document.createElement('tr');
+        tr.className = 'row-removed';
+        tr.innerHTML = `<td colspan="8">Удалены из черновика: ${removed.map(c => `<s>${escapeHtml(c.title)}</s>`).join(', ')}</td>`;
+        tbody.appendChild(tr);
+      }
+    }
   }
 
   // 6. EXECUTIVE ANALYTICS DASHBOARD
@@ -999,6 +1256,7 @@
       `;
     }
 
+    updateExportButton();
     const grid = document.getElementById('lang-channel-grid');
     if (grid) {
       const n = totalConvs;
@@ -1092,6 +1350,7 @@
       await api().createAppeal(ev.id, critId, comment);
       closeModal('appeal-modal');
       await refreshEvaluation(state.activeConvId, ev.id);
+      toast('Апелляция подана. Её видит проверяющий во вкладке «Апелляции».');
     } catch (e) {
       toast('Апелляция не отправлена: ' + e.message);
     }
@@ -1100,30 +1359,47 @@
   async function refreshEvaluation(cid, evId) {
     const fresh = await api().getEvaluation(evId);
     if (fresh) {
-      state.evaluations[cid] = fresh;
-      const conv = state.conversations.find(c => c.conversation_id === cid);
-      if (conv) syncConvFromEval(conv, fresh);
+      if (state.evalById[evId]) fresh._seq = state.evalById[evId]._seq;
+      storeEval(fresh);
     }
     collectAppeals();
     renderAll();
   }
 
-  // Review decision: POST /api/appeals/{id}/decision {decision, new_answer?, reason}
-  function openReviewModal(convId, critId) {
-    const ev = state.evaluations[convId];
+  // Review decision: POST /api/appeals/{id}/decision {decision: confirm|change, new_answer?, reason}
+  function openReviewModal(evalId, critId) {
+    const ev = state.evalById[evalId] || Object.values(state.evaluations).find(e => e.id === evalId);
     if (!ev) return;
     const crit = (ev.criteria || []).find(c => c.id === critId);
     if (!crit || !crit.appeal) return;
     const def = critDef(ev, critId) || {};
-    state.review = { convId, critId };
-
-    document.getElementById('review-modal-target').value = `${convId} — ${crit.title} (сейчас: ${answerView(def, crit).text})`;
-    document.getElementById('review-modal-conv-id').value = convId;
+    document.getElementById('review-modal-conv-id').value = ev.conversation_id;
+    document.getElementById('review-modal-eval-id').value = ev.id;
     document.getElementById('review-modal-criterion-id').value = critId;
-    document.getElementById('review-modal-operator-comment').textContent = crit.appeal.comment;
+    setText('review-modal-target', `${ev.conversation_id} — ${crit.title}`);
+    document.getElementById('review-modal-current').innerHTML = `<span class="ans-badge ${answerView(def, crit).cls}">${answerView(def, crit).text}</span>`;
+    setText('review-modal-explanation', crit.explanation || '—');
+    setText('review-modal-operator-comment', crit.appeal.comment || '');
     document.getElementById('review-modal-reason').value = '';
 
-    // New answer options come from the criterion type in the checklist
+    // fragment: evidence ±2 replicas (transcript of this conversation)
+    const frag = document.getElementById('review-modal-fragment');
+    const conv = state.conversations.find(c => c.conversation_id === ev.conversation_id);
+    const tr = (conv && conv.transcript) || [];
+    const range = focusRange(crit);
+    if (frag) {
+      if (!tr.length) frag.innerHTML = '<div class="hint-muted">Откройте диалог, чтобы увидеть фрагмент.</div>';
+      else {
+        const lo = range ? Math.max(0, range[0] - 2) : 0, hi = range ? Math.min(tr.length - 1, range[1] + 2) : Math.min(tr.length - 1, 5);
+        const evIdx = new Set((crit.evidence || []).map(e => Number(e.message_index)));
+        frag.innerHTML = tr.slice(lo, hi + 1).map((m, k) => {
+          const i = lo + k;
+          return `<div class="frag-row ${evIdx.has(i) ? 'ev' : ''}"><span>#${i} · ${escapeHtml(m.speaker)}</span>${escapeHtml(m.text)}</div>`;
+        }).join('');
+      }
+    }
+
+    // new answer options come from the criterion type in the checklist
     const sel = document.getElementById('review-modal-new-answer');
     if (sel) {
       let opts = [];
@@ -1134,13 +1410,12 @@
       const cur = String(finalAnswer(crit));
       sel.innerHTML = opts.filter(([v]) => v !== cur).map(([v, l]) => `<option value="${escapeHtml(v)}">${escapeHtml(l)}</option>`).join('');
     }
-    const decSel = document.getElementById('review-modal-decision-type');
-    const grp = document.getElementById('review-new-answer-group');
-    if (decSel && grp) {
-      decSel.value = 'confirm';
-      grp.style.display = 'none';
-      decSel.onchange = () => { grp.style.display = decSel.value === 'change' ? 'block' : 'none'; };
-    }
+    const decided = crit.appeal.status !== 'open';
+    ['btn-review-accept', 'btn-review-reject'].forEach(id => { const b = document.getElementById(id); if (b) { b.disabled = decided || !isLive(); b.style.display = decided ? 'none' : ''; } });
+    const grp = document.getElementById('review-new-answer-group'); if (grp) grp.style.display = decided ? 'none' : '';
+    const rs = document.getElementById('review-modal-reason');
+    if (rs) { rs.value = decided ? (crit.appeal.reason || '') : ''; rs.readOnly = decided; }
+    setText('review-modal-status', decided ? (crit.appeal.decision === 'change' ? 'Апелляция принята, оценка изменена.' : 'Апелляция отклонена, оценка оставлена.') : '');
     const modal = document.getElementById('review-modal');
     if (modal) modal.classList.add('active');
   }
@@ -1150,29 +1425,34 @@
     if (crit && crit.appeal && (crit.appeal.id || crit.appeal.appeal_id)) return crit.appeal.id || crit.appeal.appeal_id;
     const open = await api().getAppeals('open');
     const list = Array.isArray(open) ? open : (open && open.appeals) || [];
-    const hit = list.find(a => (a.evaluation_id === ev.id || a.conversation_id === ev.conversation_id) && a.criterion_id === critId);
-    if (!hit) throw new Error('не найден id апелляции на сервере');
+    const hit = list.find(a => a.evaluation_id === ev.id && a.criterion_id === critId);
+    if (!hit) throw new Error('открытая апелляция не найдена на сервере');
     return hit.id;
   }
 
-  async function applyReviewDecision() {
-    const convId = document.getElementById('review-modal-conv-id').value;
+  async function applyReviewDecision(decisionType) {
+    const evalId = document.getElementById('review-modal-eval-id').value;
     const critId = document.getElementById('review-modal-criterion-id').value;
-    const decisionType = document.getElementById('review-modal-decision-type').value;
     let newAnswer = document.getElementById('review-modal-new-answer').value;
     const reason = document.getElementById('review-modal-reason').value.trim();
     if (!reason) { toast('Укажите причину решения'); return; }
-    if (!isLive()) { toast('Решение по апелляции сохраняет сервер. Сейчас открыты демо-данные.'); return; }
-
-    const ev = state.evaluations[convId];
+    if (!isLive()) { toast('Решение по апелляции сохраняет сервер.'); return; }
+    const ev = state.evalById[evalId];
     if (!ev) return;
     const def = critDef(ev, critId) || {};
-    if (decisionType === 'change' && def.type === 'scale' && newAnswer !== 'na') newAnswer = Number(newAnswer);
+    if (decisionType === 'change') {
+      if (newAnswer === '') { toast('Выберите новую оценку'); return; }
+      if (def.type === 'scale' && newAnswer !== 'na') newAnswer = Number(newAnswer);
+    }
+    const before = ev.total;
     try {
       const appealId = await findAppealId(ev, critId);
-      await api().decideAppeal(appealId, decisionType, decisionType === 'change' ? newAnswer : undefined, reason);
+      const updated = await api().decideAppeal(appealId, decisionType, decisionType === 'change' ? newAnswer : undefined, reason);
       closeModal('review-modal');
-      await refreshEvaluation(convId, ev.id); // new total comes from the server (scoring.py)
+      if (updated && updated.id) { updated._seq = ev._seq; storeEval(updated); collectAppeals(); renderAll(); }
+      else await refreshEvaluation(ev.conversation_id, ev.id);
+      const after = (state.evalById[evalId] || {}).total;
+      toast(decisionType === 'change' ? `Апелляция принята. Итог: ${fmtShort(before)} → ${fmtShort(after)} (пересчитал сервер)` : 'Апелляция отклонена, оценка оставлена');
     } catch (e) {
       toast('Решение не сохранено: ' + e.message);
     }
@@ -1187,6 +1467,7 @@
     const draft = JSON.parse(JSON.stringify(base || { name: 'Новый чек-лист', version: 0, rounding: 2, criteria: [] }));
     draft.based_on = base && base.id ? base.id : state.activeChecklistKey;
     delete draft.id;
+    delete draft.active;
     draft.version = (Number(draft.version) || 0) + 1;
     state.checklists['draft'] = draft;
     state.activeChecklistKey = 'draft';
@@ -1305,39 +1586,142 @@
     renderAll();
   }
 
-  async function applyChecklistChanges() {
-    if (!isLive()) { toast('Сохранение чек-листа и пересчёт оценок выполняет сервер. Сейчас открыты демо-данные; черновик сохранён в браузере.'); return; }
-    const btn = document.getElementById('btn-apply-checklist-changes');
-    if (btn) { btn.disabled = true; btn.textContent = '⏳ Сохраняем и оцениваем…'; }
+  // Save the draft as a new version on the server and make it active for its channel
+  async function saveChecklistVersion() {
+    if (!isLive()) { toast('Сохранение чек-листа выполняет сервер. Сейчас открыты демо-данные; черновик сохранён в браузере.'); return; }
+    const draft = state.checklists['draft'];
+    if (!draft) { toast('Изменений нет: отредактируйте или добавьте критерий'); return; }
+    const btn = document.getElementById('btn-save-checklist');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Сохраняем…'; }
     try {
-      let checklistId = activeChecklist() && activeChecklist().id;
-      if (state.activeChecklistKey === 'draft') {
-        const draft = Object.assign({}, state.checklists['draft']);
-        delete draft.based_on;
-        const saved = await api().saveChecklist(draft);
-        checklistId = saved && (saved.id || saved.checklist_id);
-        if (!checklistId) throw new Error('сервер не вернул id чек-листа');
-        await api().activateChecklist(checklistId);
-        delete state.checklists['draft'];
-        try { localStorage.removeItem('cqa_checklist_draft'); } catch (e) { /* storage off */ }
-        state.checklists = await api().getChecklists();
-        state.activeChecklistKey = checklistId;
-        renderChecklistPicker();
-      }
-      const ids = state.conversations.filter(c => (activeChecklist().applies_to || 'agent chat') === c.channel).map(c => c.conversation_id);
-      if (!ids.length) { toast('Нет диалогов для канала ' + (activeChecklist().applies_to || 'agent chat')); return; }
-      if (!confirm(`Оценить ${ids.length} диалог(ов) по чек-листу «${activeChecklist().name}» v${activeChecklist().version}? Это вызовет модель для каждого диалога.`)) return;
-      await api().evaluateBatch(ids, checklistId);
-      state.conversations = await api().getConversations();
-      state.evaluations = {};
-      if (state.activeConvId) await ensureEvaluationLoaded(state.activeConvId, true);
-      collectAppeals();
-      renderAll();
-      toast(`Готово: ${ids.length} диалог(ов) отправлено на оценку по новой версии`);
+      const body = Object.assign({}, draft);
+      const base = state.checklists[draft.based_on];
+      delete body.based_on; delete body.active; delete body.id;
+      if (base && base.name === body.name && base.applies_to === body.applies_to) body.base_id = base.id;
+      const saved = await api().saveChecklist(body);
+      const newId = saved && (saved.id || saved.checklist_id);
+      if (!newId) throw new Error('сервер не вернул id чек-листа');
+      await api().activateChecklist(newId);
+      delete state.checklists['draft'];
+      try { localStorage.removeItem('cqa_checklist_draft'); } catch (e) { /* storage off */ }
+      state.checklists = await api().getChecklists();
+      state.activeChecklistKey = newId;
+      renderChecklistPicker();
+      renderChecklistTable();
+      toast(`Сохранено: «${saved.name}» v${saved.version}, активна для канала «${saved.applies_to}». Теперь нажмите «Применить к диалогам и пересчитать».`);
     } catch (e) {
-      toast('Не удалось применить чек-лист: ' + e.message);
+      toast('Не удалось сохранить чек-лист: ' + e.message);
     } finally {
-      if (btn) { btn.disabled = false; btn.textContent = 'Сохранить и применить к диалогам'; }
+      if (btn) { btn.disabled = false; btn.textContent = 'Сохранить версию'; }
+      renderChecklistActions();
+    }
+  }
+
+  // Re-evaluate all conversations of the checklist's channel with the saved version (progress in the list)
+  async function applyChecklistToDialogs() {
+    if (!isLive()) { toast('Пересчёт оценок выполняет сервер. Сейчас открыты демо-данные.'); return; }
+    if (state.activeChecklistKey === 'draft') { toast('Сначала нажмите «Сохранить версию»'); return; }
+    const cl = activeChecklist();
+    const channel = cl.applies_to || 'agent chat';
+    const ids = state.conversations.filter(c => c.channel === channel).map(c => c.conversation_id);
+    if (!ids.length) { toast('Нет диалогов канала ' + channel); return; }
+    if (!confirm(`Пересчитать ${ids.length} диалог(ов) канала «${channel}» по чек-листу «${cl.name}» v${cl.version}? Для каждого диалога сервер вызовет модель.`)) return;
+    if (state.batch) { toast('Пакетная оценка уже идёт'); return; }
+    try {
+      const job = await api().recalculateChecklist(cl.id);
+      toast(`Пересчёт запущен на сервере: ${job.total || ids.length} диалог(ов). Прогресс — в меню слева; можно работать дальше.`, 'ok');
+      await followJob(job, `Пересчёт по v${cl.version}`);
+    } catch (e) {
+      toast('Не удалось запустить пересчёт: ' + e.message);
+    }
+  }
+
+  function renderChecklistActions() {
+    const save = document.getElementById('btn-save-checklist');
+    const apply = document.getElementById('btn-apply-checklist-changes');
+    const hasDraft = state.activeChecklistKey === 'draft';
+    if (save) save.disabled = !hasDraft;
+    if (apply) apply.disabled = hasDraft || !isLive();
+    const note = document.getElementById('checklist-draft-note');
+    if (note) {
+      const cl = activeChecklist();
+      note.textContent = hasDraft ? 'Есть несохранённые изменения (черновик в браузере). Нажмите «Сохранить версию».'
+        : cl ? `Версия v${cl.version}${cl.active ? ' — активна для канала' : ''}. Изменения создадут новую версию.` : '';
+    }
+  }
+
+  // --- NEW CONVERSATION FROM JSON (POST /api/conversations) ---
+  function parseRecords(text) {
+    let data;
+    try { data = JSON.parse(text); }
+    catch (e) {
+      const m = String(e.message).match(/line (\d+) column (\d+)/);
+      throw new Error('это не JSON: проверьте скобки, кавычки и запятые' + (m ? ` (строка ${m[1]}, символ ${m[2]})` : ''));
+    }
+    let recs;
+    if (Array.isArray(data)) recs = data;
+    else if (data && data.data && Array.isArray(data.data.records)) recs = data.data.records;
+    else if (data && Array.isArray(data.records)) recs = data.records;
+    else if (data && data.conversation_id) recs = [data];
+    else throw new Error('не найден conversation_id или data.records');
+    recs.forEach((r, i) => {
+      const where = `запись ${i + 1}`;
+      if (!r.conversation_id) throw new Error(`${where}: нет conversation_id`);
+      if (!['agent chat', 'voice call'].includes(r.channel)) throw new Error(`${where}: channel должен быть "agent chat" или "voice call"`);
+      if (!Array.isArray(r.transcript) || !r.transcript.length) throw new Error(`${where}: пустой transcript`);
+      r.transcript.forEach((m, k) => {
+        if (!m || typeof m.text !== 'string' || !m.speaker) throw new Error(`${where}, реплика #${k}: нужны speaker и text`);
+        if (!['client', 'operator', 'bot', 'system'].includes(m.speaker)) throw new Error(`${where}, реплика #${k}: speaker «${m.speaker}» не из client/operator/bot/system`);
+      });
+      r.language = String(r.language || '').toUpperCase();
+      if (!['RU', 'KZ', 'EN'].includes(r.language)) throw new Error(`${where}: language должен быть RU, KZ или EN`);
+    });
+    return recs;
+  }
+  function openUploadModal() {
+    document.getElementById('upload-text').value = '';
+    document.getElementById('upload-file').value = '';
+    setText('upload-check', isLive() ? '' : 'Сейчас открыты демо-данные: загрузка работает только с сервером.');
+    const m = document.getElementById('upload-modal');
+    if (m) m.classList.add('active');
+  }
+  function checkUploadText() {
+    const box = document.getElementById('upload-check');
+    const txt = document.getElementById('upload-text').value.trim();
+    if (!txt) { box.textContent = ''; return null; }
+    try {
+      const recs = parseRecords(txt);
+      box.className = 'upload-check ok';
+      const dup = recs.filter(r => state.conversations.some(c => c.conversation_id === String(r.conversation_id)));
+      box.textContent = `✓ ${recs.length} диалог(ов): ` + recs.map(r => `${r.conversation_id} (${r.channel}, ${r.language || '—'}, ${r.transcript.length} реплик)`).join('; ')
+        + (dup.length ? ` — внимание: ${dup.map(r => r.conversation_id).join(', ')} уже есть, диалог будет заменён` : '');
+      return recs;
+    } catch (e) {
+      box.className = 'upload-check bad';
+      box.textContent = '✕ ' + e.message;
+      return null;
+    }
+  }
+  async function submitUpload() {
+    const recs = checkUploadText();
+    if (!recs) { toast('Проверьте JSON'); return; }
+    if (!isLive()) { toast('Загрузка нового диалога работает только с сервером.'); return; }
+    const btn = document.getElementById('btn-upload-submit');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Загружаем…'; }
+    try {
+      await api().addConversations(recs);
+      closeModal('upload-modal');
+      state.conversations = await api().getConversations();
+      loadTranscriptsInBackground();
+      const ids = recs.map(r => String(r.conversation_id));
+      state.activeConvId = ids[0];
+      await selectConversation(ids[0]);
+      renderAll();
+      if (document.getElementById('upload-evaluate').checked) await evaluateAll(ids, 'Оценка новых');
+    } catch (e) {
+      toast('Не удалось загрузить: ' + e.message);
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = 'Загрузить на сервер'; }
     }
   }
 
@@ -1377,42 +1761,65 @@
     loadData();
   }
 
-  function exportCSV() {
-    const headers = ['ID диалога', 'Канал', 'Язык', 'Итоговый балл CQA', 'Грубая ошибка', 'Апелляция'];
-    const rows = state.conversations.map(c => [
-      c.conversation_id,
-      `"${c.channel}"`,
-      c.language,
-      c.total_score !== null && c.total_score !== undefined ? c.total_score : '',
-      c.gross_error ? 'ДА' : 'НЕТ',
-      c.has_appeal ? 'ДА' : 'НЕТ'
-    ]);
-
-    let csvContent = 'data:text/csv;charset=utf-8,\uFEFF'
-      + [headers.join(';'), ...rows.map(e => e.join(';'))].join('\n');
-
-    const encodedUri = encodeURI(csvContent);
+  function download(filename, text, mime) {
+    const blob = new Blob([text], { type: mime });
+    const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
-    link.setAttribute('download', `freedom_broker_cqa_report_${new Date().toISOString().slice(0, 10)}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    link.href = url; link.download = filename;
+    document.body.appendChild(link); link.click(); link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  function exportRows() {
+    return state.conversations.map(c => ({ conv: c, ev: state.evaluations[c.conversation_id] || null }));
+  }
+  function exportCSV() {
+    const critIds = [];
+    exportRows().forEach(({ ev }) => (ev && ev.criteria || []).forEach(k => { if (!critIds.find(x => x.id === k.id)) critIds.push({ id: k.id, title: k.title }); }));
+    const head = ['conversation_id', 'channel', 'language', 'status', 'total', 'original_total', 'gross_error', 'gross_reason', 'model', 'cost_usd', 'checklist_id', 'checklist_version', 'open_appeals']
+      .concat(critIds.map(k => `${k.title} (${k.id})`));
+    const esc = v => { const t = v === null || v === undefined ? '' : String(v); return /[";\n]/.test(t) ? '"' + t.replace(/"/g, '""') + '"' : t; };
+    const lines = [head.map(esc).join(';')];
+    exportRows().forEach(({ conv, ev }) => {
+      const row = [conv.conversation_id, conv.channel, conv.language, ev ? ev.status : 'не оценён', ev ? ev.total : '', ev ? ev.original_total : '',
+        ev ? (ev.gross_error ? 'да' : 'нет') : '', ev && ev.gross_error ? grossReason(conv.conversation_id) : '', ev ? ev.model : '', ev ? ev.cost_usd : '',
+        ev ? ev.checklist_id : '', ev ? ev.checklist_version : '', ev ? (ev.criteria || []).filter(k => k.appeal && k.appeal.status === 'open').length : ''];
+      critIds.forEach(k => { const c = ev && (ev.criteria || []).find(x => x.id === k.id); row.push(c ? finalAnswer(c) : ''); });
+      lines.push(row.map(esc).join(';'));
+    });
+    download(`cqa_results_${new Date().toISOString().slice(0, 10)}.csv`, '\uFEFF' + lines.join('\n'), 'text/csv;charset=utf-8');
+  }
+
+  // "Экспорт результатов (JSON)": the server builds the file (GET /api/export). Disabled until the route exists.
+  async function updateExportButton() {
+    const btn = document.getElementById('btn-export-server');
+    if (!btn) return;
+    if (state.exportAvailable === undefined && isLive()) state.exportAvailable = await api().hasRoute(EXPORT_PATH);
+    const on = isLive() && state.exportAvailable === true;
+    btn.disabled = !on;
+    btn.title = !isLive() ? 'Только с сервером' : on ? 'Скачать все результаты с сервера' : 'Маршрут экспорта на сервере ещё не готов (GET /api' + EXPORT_PATH + ')';
+  }
+  async function exportFromServer() {
+    const btn = document.getElementById('btn-export-server');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Готовим файл…'; }
+    try {
+      const data = await api().exportResults();
+      download(`cqa_export_${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(data, null, 2), 'application/json');
+    } catch (e) {
+      toast('Экспорт не удался: ' + e.message);
+    } finally {
+      if (btn) { btn.textContent = '💾 Экспорт результатов (JSON)'; }
+      updateExportButton();
+    }
   }
 
   function exportJSON() {
-    const dataStr = 'data:text/json;charset=utf-8,' + encodeURIComponent(JSON.stringify({
+    const payload = {
       exported_at: new Date().toISOString(),
       source: isLive() ? api().getBaseUrl() : 'demo',
-      evaluations: state.evaluations,
-      checklist: activeChecklist()
-    }, null, 2));
-    const downloadAnchor = document.createElement('a');
-    downloadAnchor.setAttribute('href', dataStr);
-    downloadAnchor.setAttribute('download', `freedom_broker_cqa_export_${new Date().toISOString().slice(0, 10)}.json`);
-    document.body.appendChild(downloadAnchor);
-    downloadAnchor.click();
-    downloadAnchor.remove();
+      checklist: activeChecklist(),
+      results: exportRows().map(({ conv, ev }) => ({ conversation_id: conv.conversation_id, channel: conv.channel, language: conv.language, evaluation: ev ? Object.fromEntries(Object.entries(ev).filter(([k]) => k !== '_seq')) : null })),
+    };
+    download(`cqa_results_${new Date().toISOString().slice(0, 10)}.json`, JSON.stringify(payload, null, 2), 'application/json');
   }
 
   function closeModal(modalId) {
@@ -1451,6 +1858,38 @@
     if (link && conv.audio_url) link.href = conv.audio_url.split('#')[0] + '#t=' + Math.floor(Math.max(0, cur - first));
   }
 
+  // --- UI STATE THAT SURVIVES A RELOAD (data itself always comes from the server) ---
+  const TAB_HASH = { 'tab-workspace': 'dialogs', 'tab-checklist': 'checklists', 'tab-appeals': 'appeals', 'tab-analytics': 'analytics' };
+  function writeHash() {
+    const tab = (document.querySelector('.nav-tab-btn.active') || {}).dataset;
+    const name = TAB_HASH[(tab && tab.tab) || 'tab-workspace'] || 'dialogs';
+    const h = '#' + name + (name === 'dialogs' && state.activeConvId ? '/' + encodeURIComponent(state.activeConvId) : '');
+    if (location.hash !== h) history.replaceState(null, '', h);
+  }
+  function readHash() {
+    const [name, id] = location.hash.replace(/^#/, '').split('/');
+    const tab = Object.keys(TAB_HASH).find(k => TAB_HASH[k] === name);
+    return { tab: tab || null, convId: id ? decodeURIComponent(id) : null };
+  }
+  function saveUiState() {
+    try { sessionStorage.setItem('cqa_ui', JSON.stringify({ filters: state.filters, checklist: state.activeChecklistKey })); } catch (e) { /* storage off */ }
+  }
+  function restoreUiState() {
+    try {
+      const ui = JSON.parse(sessionStorage.getItem('cqa_ui') || 'null');
+      if (ui && ui.filters) Object.assign(state.filters, ui.filters);
+      if (ui && ui.checklist) state.activeChecklistKey = ui.checklist;
+    } catch (e) { /* storage off */ }
+    const f = state.filters;
+    const chip = f.status !== 'all' ? f.status : (f.channel !== 'all' ? f.channel : 'all');
+    document.querySelectorAll('.filter-chips button[data-filter]').forEach(b => b.classList.toggle('active', b.dataset.filter === chip));
+    document.querySelectorAll('.filter-chips button[data-lang]').forEach(b => b.classList.toggle('active', b.dataset.lang === f.lang));
+    const si = document.getElementById('conv-search-input'); if (si) si.value = f.search || '';
+    const h = readHash();
+    if (h.convId) state.activeConvId = h.convId;
+    if (h.tab) switchTab(h.tab);
+  }
+
   function switchTab(tabId) {
     document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.nav-tab-btn').forEach(b => b.classList.remove('active'));
@@ -1460,6 +1899,7 @@
 
     const btn = document.querySelector(`[data-tab="${tabId}"]`);
     if (btn) btn.classList.add('active');
+    writeHash();
   }
 
   // --- BIND EVENTS ---
@@ -1472,6 +1912,7 @@
     if (chkPicker) {
       chkPicker.onchange = () => {
         state.activeChecklistKey = chkPicker.value;
+        saveUiState();
         renderAll();
       };
     }
@@ -1488,6 +1929,7 @@
     if (searchInput) {
       searchInput.oninput = (e) => {
         state.filters.search = e.target.value;
+        saveUiState();
         renderConversationsList();
       };
     }
@@ -1498,6 +1940,7 @@
         btn.classList.add('active');
         state.filters.channel = btn.dataset.filter === 'chat' || btn.dataset.filter === 'voice' ? btn.dataset.filter : 'all';
         state.filters.status = btn.dataset.filter === 'error' || btn.dataset.filter === 'appeal' ? btn.dataset.filter : 'all';
+        saveUiState();
         renderConversationsList();
       };
     });
@@ -1507,6 +1950,7 @@
         document.querySelectorAll('.filter-chips button[data-lang]').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
         state.filters.lang = btn.dataset.lang;
+        saveUiState();
         renderConversationsList();
       };
     });
@@ -1514,8 +1958,10 @@
     const submitAppealBtn = document.getElementById('btn-submit-appeal');
     if (submitAppealBtn) submitAppealBtn.onclick = submitAppeal;
 
-    const applyReviewBtn = document.getElementById('btn-apply-review-decision');
-    if (applyReviewBtn) applyReviewBtn.onclick = applyReviewDecision;
+    const acceptBtn = document.getElementById('btn-review-accept');
+    if (acceptBtn) acceptBtn.onclick = () => applyReviewDecision('change');
+    const rejectBtn = document.getElementById('btn-review-reject');
+    if (rejectBtn) rejectBtn.onclick = () => applyReviewDecision('confirm');
 
     const addCritBtn = document.getElementById('btn-add-criterion');
     if (addCritBtn) addCritBtn.onclick = openAddCriterionModal;
@@ -1523,15 +1969,32 @@
     const saveCritBtn = document.getElementById('btn-save-criterion');
     if (saveCritBtn) saveCritBtn.onclick = saveCriterion;
 
+    const upBtn = document.getElementById('btn-open-upload');
+    if (upBtn) upBtn.onclick = openUploadModal;
+    const upText = document.getElementById('upload-text');
+    if (upText) upText.oninput = checkUploadText;
+    const upFile = document.getElementById('upload-file');
+    if (upFile) upFile.onchange = () => {
+      const f = upFile.files[0]; if (!f) return;
+      const rd = new FileReader();
+      rd.onload = () => { upText.value = rd.result; checkUploadText(); };
+      rd.readAsText(f);
+    };
+    const upSubmit = document.getElementById('btn-upload-submit');
+    if (upSubmit) upSubmit.onclick = submitUpload;
+    const saveChkBtn = document.getElementById('btn-save-checklist');
+    if (saveChkBtn) saveChkBtn.onclick = saveChecklistVersion;
     const resetChkBtn = document.getElementById('btn-reset-checklist');
     if (resetChkBtn) resetChkBtn.onclick = resetChecklist;
 
     const applyChkBtn = document.getElementById('btn-apply-checklist-changes');
-    if (applyChkBtn) applyChkBtn.onclick = applyChecklistChanges;
+    if (applyChkBtn) applyChkBtn.onclick = applyChecklistToDialogs;
 
     const exportCsvBtn = document.getElementById('btn-export-csv');
     if (exportCsvBtn) exportCsvBtn.onclick = exportCSV;
 
+    const exportServerBtn = document.getElementById('btn-export-server');
+    if (exportServerBtn) exportServerBtn.onclick = exportFromServer;
     const exportJsonBtn = document.getElementById('btn-export-json');
     if (exportJsonBtn) exportJsonBtn.onclick = exportJSON;
 
