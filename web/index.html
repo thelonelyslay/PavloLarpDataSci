@@ -41,12 +41,18 @@
         <option value="default">Чек-лист чатов Freedom (8 критериев)</option>
         <option value="calls">Чек-лист звонков Freedom (8 критериев)</option>
       </select>
-      <div class="api-status" id="api-status-pill">
+      <div class="api-status" id="api-status-pill" onclick="app.openApiModal()" style="cursor: pointer;" title="Нажмите для настройки источника данных API">
         <span class="status-dot"></span>
-        <span id="api-status-text">Демо-режим (Автономный)</span>
+        <span id="api-status-text">Файл-заглушка (mock_data.json)</span>
       </div>
     </div>
   </header>
+
+  <!-- GLOBAL ERROR / LOADING BANNERS -->
+  <div id="global-error-banner" class="global-error-banner" style="display: none;">
+    <span id="global-error-text">Ошибка подключения к API</span>
+    <button class="btn-retry" onclick="app.reloadConversations()">Повторить попытку</button>
+  </div>
 
   <!-- MAIN APP CONTAINER -->
   <main class="app-container">
@@ -214,6 +220,20 @@
           </div>
         </div>
 
+        <!-- CHECKLIST META & WEIGHT SUM INDICATOR -->
+        <div style="display: flex; justify-content: space-between; align-items: center; background: #ffffff; padding: 12px 18px; border: 1px solid var(--border); border-radius: var(--radius-md);">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <label style="font-weight: 600; font-size: 13px;">Тип диалогов (канал):</label>
+            <select id="checklist-channel-select" class="form-control" style="width: auto; padding: 4px 10px;">
+              <option value="agent chat">💬 Текстовые чаты (agent chat)</option>
+              <option value="voice call">📞 Голосовые звонки (voice call)</option>
+            </select>
+          </div>
+          <div id="checklist-weight-indicator" class="weight-indicator-badge">
+            <!-- Rendered by app.js: Сумма весов: 100 / 100 -->
+          </div>
+        </div>
+
         <div class="data-table-card">
           <table class="custom-table">
             <thead>
@@ -221,10 +241,10 @@
                 <th>#</th>
                 <th>Секция</th>
                 <th>Критерий</th>
-                <th>Тип ответа</th>
+                <th>Тип</th>
                 <th>Вес</th>
-                <th>N/A доступен</th>
-                <th>Шкала / Описание</th>
+                <th>N/A</th>
+                <th style="min-width: 220px;">Правила и уточнения (rules)</th>
                 <th>Действия</th>
               </tr>
             </thead>
@@ -452,7 +472,11 @@
         </div>
         <div class="form-group">
           <label>Инструкция по оценке:</label>
-          <textarea id="crit-edit-instruction" class="form-control"></textarea>
+          <textarea id="crit-edit-instruction" class="form-control" style="min-height: 60px;"></textarea>
+        </div>
+        <div class="form-group">
+          <label>Правила и уточнения (rules):</label>
+          <textarea id="crit-edit-rules" class="form-control" placeholder="Укажите конкретные правила: когда ставить «нет», когда N/A..." style="min-height: 60px;"></textarea>
         </div>
       </div>
       <div class="modal-footer">
@@ -462,9 +486,38 @@
     </div>
   </div>
 
+  <!-- MODAL: API CONNECTION (ALIKHAN BACKEND TOGGLE) -->
+  <div class="modal-overlay" id="api-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>Подключение к API (Сервер Алихана)</h3>
+        <button class="close-btn" onclick="app.closeModal('api-modal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Источник данных:</label>
+          <select id="api-source-select" class="form-control">
+            <option value="mock">Файл-заглушка (mock_data.json)</option>
+            <option value="live">Сервер FastAPI (Алихан)</option>
+          </select>
+        </div>
+        <div class="form-group" id="api-url-group">
+          <label>URL API сервера:</label>
+          <input type="text" id="api-url-input" class="form-control" value="http://localhost:8000/api">
+          <span style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Формат ответа соответствует контракту AGENTS.md</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" onclick="app.closeModal('api-modal')">Отмена</button>
+        <button class="btn-primary" id="btn-save-api-config">Применить источник</button>
+      </div>
+    </div>
+  </div>
+
   <!-- SCRIPT INCLUDES -->
   <script src="mock_data.js"></script>
   <script src="checklists.js"></script>
+  <script src="api.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

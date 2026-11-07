@@ -1233,3 +1233,67 @@ textarea.form-control {
   gap: 10px;
   background: #f8fafc;
 }
+
+/* ERROR AND RETRY BANNERS */
+.global-error-banner {
+  background: #fef2f2;
+  border-bottom: 1px solid #f87171;
+  color: #991b1b;
+  padding: 8px 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 600;
+  z-index: 99;
+}
+
+.btn-retry {
+  background: #dc2626;
+  color: #ffffff;
+  border: none;
+  padding: 3px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.btn-retry:hover {
+  background: #b91c1c;
+}
+
+/* CHECKLIST WEIGHT INDICATOR */
+.weight-indicator-badge {
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.weight-indicator-ok {
+  background: #d1fae5;
+  color: #065f46;
+  border: 1px solid #a7f3d0;
+}
+
+.weight-indicator-warn {
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fde68a;
+}
+
+/* RULES BOX ON CRITERION */
+.rules-box {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-left: 3px solid #3b82f6;
+  color: #334155;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  line-height: 1.4;
+}
