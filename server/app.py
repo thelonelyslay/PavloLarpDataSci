@@ -23,6 +23,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 import certifi
 
 from src.cqa.scoring import validate_checklist
+from src.cqa.normalize import normalize_record
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -156,6 +157,9 @@ def import_conversations() -> int:
     for record in data["records"]:
         if not isinstance(record, dict) or not record.get("conversation_id") or not isinstance(record.get("transcript"), list):
             raise ValueError("Data API record is missing conversation_id or transcript")
+        record, warnings = normalize_record(record)  # ru/kk, chat/call, agent/customer -> canonical codes
+        for warning in warnings:
+            print("WARNING:", warning)
         records.append((str(record["conversation_id"]), record.get("channel", ""),
                         record.get("language", ""), json.dumps(record["transcript"], ensure_ascii=False),
                         record.get("audio_url")))
@@ -313,6 +317,9 @@ def list_conversations(gross_error: Optional[bool] = None) -> list[dict]:
 
 @app.post("/api/conversations", status_code=201)
 def create_conversation(record: dict) -> dict:
+    record, warnings = normalize_record(record) if isinstance(record, dict) else (record, [])
+    for warning in warnings:
+        print("WARNING:", warning)
     conversation_id = record.get("conversation_id") or record.get("id")
     channel = record.get("channel")
     language = record.get("language")

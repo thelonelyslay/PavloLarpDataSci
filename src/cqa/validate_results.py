@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import scoring
+from normalize import normalize_record
 
 HERE = Path(__file__).resolve().parent
 SCHEMA_VERSION = "1.0"
@@ -75,7 +76,7 @@ def load_checklists() -> tuple[dict, dict]:
 
 
 def load_dialogs(path: Path) -> dict[str, dict]:
-    records = json.loads(path.read_text(encoding="utf-8"))["data"]["records"]
+    records = [normalize_record(r)[0] for r in json.loads(path.read_text(encoding="utf-8"))["data"]["records"]]
     return {str(r["conversation_id"]): r for r in records}
 
 

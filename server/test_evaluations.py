@@ -279,6 +279,19 @@ class WeightOnlyChangeTest(unittest.TestCase):
         self.assertGreater(peak[0], 1)
 
 
+class NormalizationOnLoadTest(unittest.TestCase):
+    def test_create_conversation_normalizes_codes(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(app, "DB_PATH", Path(tmp) / "t.sqlite3"):
+            app._init_db()
+            with patch("builtins.print") as printed:
+                saved = app.create_conversation({"conversation_id": "n-1", "language": "kk", "channel": "chat",
+                                                 "transcript": [{"speaker": "customer", "text": "Сәлем"},
+                                                                {"speaker": "bot", "text": "Күте тұрыңыз"}]})
+            self.assertEqual((saved["language"], saved["channel"]), ("KZ", "agent chat"))
+            self.assertEqual([m["speaker"] for m in saved["transcript"]], ["client", "bot"])
+            self.assertIn("нет ни одной реплики оператора", " ".join(str(c) for c in printed.call_args_list))
+
+
 class ExportEndpointTest(unittest.TestCase):
     """GET /api/export: only ready evaluations by default, log tail on failure, ok/error counts on success."""
 

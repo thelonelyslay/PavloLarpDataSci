@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import scoring
+from normalize import normalize_record
 from validate_results import CRITERIA_MAP, SCHEMA_VERSION, validate_file
 
 HERE = Path(__file__).resolve().parent
@@ -419,7 +420,12 @@ def load_source(args) -> tuple[list[dict], Path]:
         path = ROOT / "data" / "raw" / "dev.json"
     else:
         sys.exit("Укажите источник диалогов: --from-file путь.json или --from-api [--group-id ...]")
-    records = json.loads(path.read_text(encoding="utf-8"))["data"]["records"]
+    records = []
+    for raw in json.loads(path.read_text(encoding="utf-8"))["data"]["records"]:
+        rec, warnings = normalize_record(raw)  # same codes the server stores
+        for w in warnings:
+            print("ВНИМАНИЕ:", w)
+        records.append(rec)
     if args.ids:
         wanted = set(args.ids)
         records = [r for r in records if r.get("conversation_id") in wanted]
