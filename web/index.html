@@ -273,8 +273,8 @@
       <div class="analytics-view-container">
         <div class="view-header">
           <div>
-            <h2>Сводная аналитика качества обслуживания (Executive QA Dashboard)</h2>
-            <p>Комплексный мониторинг соблюдения стандартов сервиса, эффективности работы операторов и комплаенс-рисков</p>
+            <h2>Аналитика качества обслуживания</h2>
+            <p>Итоги оценок, грубые ошибки, апелляции и соблюдение критериев чек-листа по всем диалогам</p>
           </div>
           <div class="export-actions">
             <button class="btn-secondary" id="btn-open-settings">⚙ Пороги отображения</button>
@@ -286,7 +286,7 @@
         <!-- TOP KPI CARDS -->
         <div class="kpi-grid">
           <div class="kpi-card">
-            <span class="kpi-title">Средний CQA Index</span>
+            <span class="kpi-title">Средний итог</span>
             <div class="kpi-val" id="kpi-avg-score">—</div>
             <span class="kpi-sub" id="kpi-target-sub">Целевой уровень (настройка)</span>
           </div>
@@ -296,14 +296,14 @@
             <span class="kpi-sub" id="kpi-total-sub">—</span>
           </div>
           <div class="kpi-card">
-            <span class="kpi-title">Инциденты комплаенс</span>
+            <span class="kpi-title">Грубые ошибки</span>
             <div class="kpi-val" id="kpi-gross-errors" style="color: var(--danger);">—</div>
-            <span class="kpi-sub">Грубые ошибки регламента</span>
+            <span class="kpi-sub">Диалогов с нарушением</span>
           </div>
           <div class="kpi-card">
-            <span class="kpi-title">Индекс апелляций</span>
+            <span class="kpi-title">Открытые апелляции</span>
             <div class="kpi-val" id="kpi-appeals-count" style="color: var(--warning);">—</div>
-            <span class="kpi-sub">Обращений на пересмотр</span>
+            <span class="kpi-sub">Ждут решения проверяющего</span>
           </div>
         </div>
 

@@ -73,12 +73,14 @@
     }
     return { cls: 'ans-na', text: '—' };
   }
-  function fmt2(n) { return n === null || n === undefined || isNaN(n) ? '—' : Number(n).toFixed(2); }
+  function fmt2(n) { return n === null || n === undefined || isNaN(n) ? '—' : Number(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
   // Floating notice: red for problems, green for done
   function toast(msg, kind) {
     const bad = kind === 'error' || (kind === undefined && /не удалось|ошибк|не сохранен|не отправлен|^укажите|^выберите|^проверьте|только с сервером|недоступ|нет диалогов|сначала|изменений нет|не принимает/i.test(msg));
     let box = document.getElementById('toast-box');
     if (!box) { box = document.createElement('div'); box.id = 'toast-box'; document.body.appendChild(box); }
+    // at most two at a time: drop the oldest
+    while (box.children.length >= 2) box.firstElementChild.remove();
     const t = document.createElement('div');
     t.className = 'toast ' + (bad ? 'toast-bad' : 'toast-ok');
     t.textContent = msg;
@@ -597,7 +599,11 @@
 
     // Render messages with replica numbers (#0, #1, #2, ...)
     if (streamEl) {
+      const sameConv = streamEl.dataset.conv === conv.conversation_id;
+      const keepScroll = sameConv ? streamEl.scrollTop : 0; // a new conversation starts at the first replica
+      streamEl.dataset.conv = conv.conversation_id;
       streamEl.innerHTML = '';
+      requestAnimationFrame(() => { streamEl.scrollTop = keepScroll; });
       if (!conv.transcript || conv.transcript.length === 0) {
         streamEl.innerHTML = '<div style="padding: 30px; text-align: center; color: var(--text-muted);">Транскрипт загружается или пуст</div>';
         return;
@@ -1032,13 +1038,25 @@
     return Number(n).toLocaleString('ru-RU', { maximumFractionDigits: 2 });
   }
 
+  // Scroll the transcript box only (never the whole page). mode: 'nearest' keeps it if visible, 'center' centres it.
+  function scrollStreamTo(idx, mode) {
+    const box = document.getElementById('chat-stream');
+    const el = document.getElementById(`msg-${idx}`);
+    if (!box || !el) return;
+    const top = el.offsetTop; // .chat-stream is position: relative, so offsetTop is inside the box
+    const visible = top >= box.scrollTop && top + el.offsetHeight <= box.scrollTop + box.clientHeight;
+    if (mode === 'nearest' && visible) return;
+    const target = mode === 'center' ? top - (box.clientHeight - el.offsetHeight) / 2 : top - 8;
+    box.scrollTo({ top: Math.max(0, target), behavior: 'smooth' });
+  }
+
   function selectCriterion(id) {
     state.selCrit = id;
     document.querySelectorAll('.cs-row').forEach(r => r.classList.toggle('sel', r.dataset.crit === id));
     document.querySelectorAll('.criterion-card[data-crit]').forEach(r => r.classList.toggle('sel', r.dataset.crit === id));
     applyFocus();
     const range = focusRange(selectedCrit());
-    if (range) { const el = document.getElementById(`msg-${range[0]}`); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+    if (range) scrollStreamTo(range[0], 'nearest');
   }
 
   // Highlights the selected criterion's evidence in the transcript and on the timeline, fills "why" and the buttons
@@ -1237,7 +1255,7 @@
     const grossEl = document.getElementById('kpi-gross-errors');
     const appealsEl = document.getElementById('kpi-appeals-count');
 
-    if (avgEl) avgEl.textContent = validScores.length ? avgScore.toFixed(2) : '—';
+    if (avgEl) avgEl.textContent = validScores.length ? fmtShort(avgScore) : '—';
     if (totalEl) totalEl.textContent = totalConvs;
     if (grossEl) grossEl.textContent = grossErrors;
     if (appealsEl) appealsEl.textContent = appealsCount;
@@ -1271,7 +1289,7 @@
           <span class="distrib-bar-val">${fair} (${Math.round((fair / totalConvs) * 100)}%)</span>
         </div>
         <div class="distrib-bar-row">
-          <span class="distrib-bar-label">Грубые ошибки (Комплаенс):</span>
+          <span class="distrib-bar-label">Грубые ошибки:</span>
           <div class="distrib-bar-track"><div class="distrib-bar-fill" style="width: ${(grossErrors / totalConvs) * 100}%; background: var(--danger);"></div></div>
           <span class="distrib-bar-val" style="color: var(--danger);">${grossErrors} (${Math.round((grossErrors / totalConvs) * 100)}%)</span>
         </div>
@@ -1656,7 +1674,7 @@
     const channel = cl.applies_to || 'agent chat';
     const ids = state.conversations.filter(c => c.channel === channel).map(c => c.conversation_id);
     if (!ids.length) { toast('Нет диалогов канала ' + channel); return; }
-    if (!confirm(`Пересчитать ${ids.length} диалог(ов) канала «${channel}» по чек-листу «${cl.name}» v${cl.version}? Для каждого диалога сервер вызовет модель.`)) return;
+    if (!confirm(`Пересчитать ${ids.length} диалог(ов) канала «${channel}» по чек-листу «${cl.name}» v${cl.version}?\n\nЕсли менялись только веса, модель не вызывается и итог пересчитывается сразу. Если менялись критерии или правила, диалоги будут переоценены моделью.`)) return;
     if (state.batch) { toast('Пакетная оценка уже идёт'); return; }
     try {
       const job = await api().recalculateChecklist(cl.id);
@@ -1873,8 +1891,10 @@
       const m = document.getElementById(`msg-${i}`);
       if (m) { m.classList.add('pulse-highlight'); setTimeout(() => m.classList.remove('pulse-highlight'), 2200); }
     }
-    const el = document.getElementById(`msg-${msgIndex}`);
-    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    scrollStreamTo(msgIndex, 'center');
+    // bring the transcript card itself on screen if the page is scrolled away (no jump if already visible)
+    const card = document.querySelector('.transcript-card');
+    if (card) { const r = card.getBoundingClientRect(); if (r.bottom < 80 || r.top > window.innerHeight - 80) card.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
     highlightTimeline([msgIndex, last]);
     seekAudioToReplica(msgIndex);
   }

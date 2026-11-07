@@ -1379,7 +1379,7 @@ body { flex-direction: row; background: var(--page-bg); }
 .analysis-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
 .transcript-card, .quality-card { padding: 20px 22px; }
 .transcript-card .card-title { margin-bottom: 8px; }
-.transcript-card .chat-stream { padding: 0; gap: 0; max-height: 520px; overflow-y: auto; }
+.transcript-card .chat-stream { padding: 0; gap: 0; max-height: 520px; overflow-y: auto; position: relative; }
 
 /* transcript rows (mockup style) */
 .chat-stream .chat-message-row { align-items: stretch !important; border-top: 1px solid #eceeed; border-radius: 0; padding: 12px 14px; margin: 0; cursor: pointer; }
@@ -1531,3 +1531,8 @@ tr.row-removed td { background: #fef2f2; color: #991b1b; font-size: 12.5px; }
 .cs-name { overflow-wrap: anywhere; hyphens: auto; }
 .cs-pts { flex: none; margin-left: 6px; }
 .weight-indicator-info { background: #f1f5f3; color: #334155; border: 1px solid #e2e8f0; }
+
+/* Toasts: bottom-left over the conversation list, away from the action buttons; max two at a time (app.js) */
+#toast-box { left: 214px; right: auto; bottom: 16px; max-width: 300px; }
+.toast { font-size: 12.5px; padding: 9px 12px; }
+@media (max-width: 900px) { #toast-box { left: 76px; } }
