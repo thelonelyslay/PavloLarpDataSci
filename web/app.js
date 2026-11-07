@@ -1248,7 +1248,9 @@
     const validScores = state.conversations.filter(c => c.total_score !== null && c.total_score !== undefined).map(c => c.total_score);
     const avgScore = validScores.length > 0 ? (validScores.reduce((a, b) => a + b, 0) / validScores.length) : 0;
     const grossErrors = state.conversations.filter(c => c.gross_error).length;
-    const appealsCount = state.appeals.length;
+    // Only appeals still waiting for a reviewer; decided ones are counted in "Всего подано"
+    const openAppeals = state.appeals.filter(a => a.appeal && a.appeal.status === 'open').length;
+    const totalAppeals = state.appeals.length;
 
     const avgEl = document.getElementById('kpi-avg-score');
     const totalEl = document.getElementById('kpi-total-convs');
@@ -1258,7 +1260,9 @@
     if (avgEl) avgEl.textContent = validScores.length ? fmtShort(avgScore) : '—';
     if (totalEl) totalEl.textContent = totalConvs;
     if (grossEl) grossEl.textContent = grossErrors;
-    if (appealsEl) appealsEl.textContent = appealsCount;
+    if (appealsEl) appealsEl.textContent = openAppeals;
+    const appealsSub = document.getElementById('kpi-appeals-sub');
+    if (appealsSub) appealsSub.textContent = (openAppeals ? 'Ждут решения проверяющего' : 'Нет нерешённых') + ` · Всего подано: ${totalAppeals}`;
 
     const st = state.settings;
     const scoredConvs = state.conversations.filter(c => c.total_score !== null && c.total_score !== undefined);
