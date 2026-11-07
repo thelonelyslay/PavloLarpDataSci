@@ -1621,7 +1621,7 @@
     const channel = cl.applies_to || 'agent chat';
     const ids = state.conversations.filter(c => c.channel === channel).map(c => c.conversation_id);
     if (!ids.length) { toast('Нет диалогов канала ' + channel); return; }
-    if (!confirm(`Пересчитать ${ids.length} диалог(ов) канала «${channel}» по чек-листу «${cl.name}» v${cl.version}? Для каждого диалога сервер вызовет модель.`)) return;
+    if (!confirm(`Пересчитать ${ids.length} диалог(ов) канала «${channel}» по чек-листу «${cl.name}» v${cl.version}?\n\nЕсли менялись только веса, модель не вызывается и итог пересчитывается сразу. Если менялись критерии или правила, диалоги будут переоценены моделью.`)) return;
     if (state.batch) { toast('Пакетная оценка уже идёт'); return; }
     try {
       const job = await api().recalculateChecklist(cl.id);
