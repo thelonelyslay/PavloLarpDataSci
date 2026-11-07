@@ -1856,11 +1856,14 @@
   async function exportFromServer() {
     const btn = document.getElementById('btn-export-server');
     if (btn) { btn.disabled = true; btn.textContent = '⏳ Сервер собирает файл… (может занять несколько минут)'; }
-    toast('Выгрузка запущена: сервер оценивает недостающие диалоги и проверяет формат. Можно работать дальше.', 'ok');
+    toast('Выгрузка запущена: сервер собирает файл из готовых оценок и проверяет формат. Можно работать дальше.', 'ok');
     try {
       const file = await api().exportResults();
       download(file.filename || `dev_results_${new Date().toISOString().slice(0, 10)}.json`, file.text, 'application/json');
-      toast('Файл результатов скачан', 'ok');
+      // X-Export-Ok / X-Export-Error from the server: a file with error records must not be handed in as final
+      if (file.errors > 0) toast(`В файле ${file.errors} записей с ошибкой, не сдавайте его как готовый`, 'error');
+      else if (file.ok !== null && file.ok !== undefined) toast(`Файл скачан: ok ${file.ok}, ошибок 0`, 'ok');
+      else toast('Файл результатов скачан', 'ok');
     } catch (e) {
       toast('Экспорт не удался: ' + e.message);
     } finally {

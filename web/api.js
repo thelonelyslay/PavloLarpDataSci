@@ -269,7 +269,8 @@ window.CQA_API = (function () {
         }
         const cd = res.headers.get('Content-Disposition') || '';
         const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
-        return { text, filename: m ? decodeURIComponent(m[1]) : null };
+        const num = h => (res.headers.get(h) === null ? null : Number(res.headers.get(h)));
+        return { text, filename: m ? decodeURIComponent(m[1]) : null, ok: num('X-Export-Ok'), errors: num('X-Export-Error') };
       } catch (e) {
         if (e.name === 'AbortError') throw new Error('сервер не ответил за 65 минут');
         throw e;
