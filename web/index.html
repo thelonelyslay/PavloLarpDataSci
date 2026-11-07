@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Freedom Broker CQA · Оценка качества диалогов</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- TOP NAVBAR -->
+  <header class="navbar">
+    <div class="brand">
+      <div class="brand-logo">F</div>
+      <div class="brand-text">
+        <h1>FREEDOM BROKER</h1>
+        <p>CQA · Conversation Quality Analytics | NU Data Challenge</p>
+      </div>
+    </div>
+
+    <!-- TABS NAVIGATION -->
+    <nav class="nav-tabs">
+      <button class="nav-tab-btn active" data-tab="tab-workspace" id="nav-btn-workspace">
+        <span>💬 Диалоги и оценка</span>
+      </button>
+      <button class="nav-tab-btn" data-tab="tab-appeals" id="nav-btn-appeals">
+        <span>⚖️ Центр апелляций</span>
+        <span class="nav-badge" id="appeals-badge-count">1</span>
+      </button>
+      <button class="nav-tab-btn" data-tab="tab-checklist" id="nav-btn-checklist">
+        <span>⚙️ Конструктор чек-листа</span>
+      </button>
+      <button class="nav-tab-btn" data-tab="tab-pitch" id="nav-btn-pitch">
+        <span>⏱️ Гид по защите (5 мин)</span>
+      </button>
+    </nav>
+
+    <!-- NAVBAR RIGHT: STATUS & CONFIG -->
+    <div class="navbar-right">
+      <select id="checklist-picker" class="checklist-selector" title="Выбор активного чек-листа">
+        <option value="default">Чек-лист чатов Freedom (8 критериев)</option>
+        <option value="calls">Чек-лист звонков Freedom (8 критериев)</option>
+      </select>
+      <div class="api-status" id="api-status-pill">
+        <span class="status-dot"></span>
+        <span id="api-status-text">Демо-режим (Автономный)</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- MAIN APP CONTAINER -->
+  <main class="app-container">
+
+    <!-- TAB 1: WORKSPACE (3 COLUMNS) -->
+    <div class="tab-content active" id="tab-workspace">
+      <div class="workspace-grid">
+        
+        <!-- COLUMN 1: SIDEBAR (CONVERSATIONS LIST) -->
+        <aside class="sidebar-conversations">
+          <div class="sidebar-header">
+            <div class="search-box">
+              <span class="search-icon">🔍</span>
+              <input type="text" id="conv-search-input" class="search-input" placeholder="Поиск по ID или тексту...">
+            </div>
+
+            <div class="filter-chips">
+              <button class="chip-btn active" data-filter="all">Все</button>
+              <button class="chip-btn" data-filter="chat">💬 Чаты</button>
+              <button class="chip-btn" data-filter="voice">📞 Звонки</button>
+              <button class="chip-btn" data-filter="error">⚠️ Нарушения</button>
+              <button class="chip-btn" data-filter="appeal">⚖️ Апелляции</button>
+            </div>
+
+            <div class="filter-chips" style="border-top: 1px dashed var(--border); padding-top: 6px;">
+              <span style="font-size: 11px; color: var(--text-muted); align-self: center;">Язык:</span>
+              <button class="chip-btn active" data-lang="all">Все</button>
+              <button class="chip-btn" data-lang="RU">RU</button>
+              <button class="chip-btn" data-lang="KZ">KZ</button>
+              <button class="chip-btn" data-lang="EN">EN</button>
+            </div>
+          </div>
+
+          <div class="conversations-list" id="conversations-list">
+            <!-- Dynamically populated via app.js -->
+          </div>
+        </aside>
+
+        <!-- COLUMN 2: TRANSCRIPT PANEL -->
+        <section class="transcript-panel">
+          <div class="transcript-header">
+            <div class="conv-meta-title">
+              <h2 id="active-conv-title">Загрузка диалога...</h2>
+              <div class="conv-meta-sub" id="active-conv-sub">—</div>
+            </div>
+            <div id="transcript-actions">
+              <!-- Action buttons / badge info -->
+            </div>
+          </div>
+
+          <!-- AUDIO PLAYER (SHOWN FOR VOICE CALLS) -->
+          <div class="audio-player-bar" id="voice-audio-bar" style="display: none;">
+            <div class="audio-controls">
+              <button class="audio-btn" id="audio-play-btn" title="Воспроизвести / Пауза">▶</button>
+              <span id="audio-time-current" style="font-size: 11px; font-weight: 600; min-width: 40px;">00:00</span>
+              <div class="audio-timeline">
+                <input type="range" id="audio-seek" value="0" min="0" max="100">
+              </div>
+              <span id="audio-time-duration" style="font-size: 11px; color: var(--text-muted); min-width: 40px;">03:15</span>
+              <select id="audio-speed" class="audio-speed-select">
+                <option value="0.75">0.75x</option>
+                <option value="1" selected>1.0x</option>
+                <option value="1.25">1.25x</option>
+                <option value="1.5">1.5x</option>
+                <option value="2">2.0x</option>
+              </select>
+            </div>
+            <a href="#" id="audio-external-link" target="_blank" class="dynamics-link-btn" title="Открыть плеер Dynamics 365">
+              <span>Плеер Dynamics ↗</span>
+            </a>
+            <audio id="html5-audio-element" style="display: none;"></audio>
+          </div>
+
+          <!-- CHAT MESSAGES STREAM (EVERY MESSAGE HAS REPLICA # INDEX) -->
+          <div class="chat-stream" id="chat-stream">
+            <!-- Rendered by app.js -->
+          </div>
+        </section>
+
+        <!-- COLUMN 3: EVALUATION SCORECARD -->
+        <section class="evaluation-panel">
+          <div class="eval-header">
+            <div class="eval-summary-card">
+              <div class="score-top-row">
+                <div>
+                  <span style="font-size: 11px; color: var(--text-muted); font-weight: 600; text-transform: uppercase;">Итоговый балл CQA</span>
+                  <div class="score-main">
+                    <span class="score-num" id="total-score-display">0.00</span>
+                    <span class="score-max">/ 100</span>
+                  </div>
+                </div>
+                <div class="score-label-badge badge-excellent" id="score-status-badge">Отлично</div>
+              </div>
+
+              <!-- CRITICAL VIOLATION WARNING BANNER -->
+              <div class="gross-error-banner" id="gross-error-banner" style="display: none;">
+                <span>⚠️</span>
+                <span id="gross-error-text">Обнаружена грубая ошибка в диалоге!</span>
+              </div>
+
+              <!-- SECTION SCORES PROGRESS -->
+              <div class="sections-summary" id="sections-summary">
+                <!-- Rendered dynamically -->
+              </div>
+
+              <div class="eval-meta-row">
+                <span id="eval-model-tag">Модель: Gemini 2.0 Flash</span>
+                <span id="eval-cost-tag">Стоимость: $0.0012</span>
+                <span id="eval-version-tag">Чек-лист: v1</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- DETAILED CRITERIA LIST -->
+          <div class="criteria-container" id="criteria-container">
+            <!-- Rendered by app.js -->
+          </div>
+        </section>
+
+      </div>
+    </div>
+
+    <!-- TAB 2: APPEALS CENTER -->
+    <div class="tab-content" id="tab-appeals">
+      <div class="appeals-view-container">
+        <div class="view-header">
+          <div>
+            <h2>Центр апелляций и контроля качества (QC)</h2>
+            <p>Просмотр оспариваемых операторами оценок, пересмотр и утверждение финальных баллов</p>
+          </div>
+        </div>
+
+        <div class="data-table-card">
+          <table class="custom-table">
+            <thead>
+              <tr>
+                <th>ID диалога</th>
+                <th>Критерий</th>
+                <th>Оценка ИИ</th>
+                <th>Комментарий оператора</th>
+                <th>Статус</th>
+                <th>Действие проверяющего</th>
+              </tr>
+            </thead>
+            <tbody id="appeals-table-body">
+              <!-- Rendered dynamically -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 3: CHECKLIST CONFIGURATOR -->
+    <div class="tab-content" id="tab-checklist">
+      <div class="checklist-view-container">
+        <div class="view-header">
+          <div>
+            <h2>Конструктор чек-листа оценки качества</h2>
+            <p>Управление критериями, весами, формулировками и шкалами. Изменения сохраняются и сразу применяются к диалогам.</p>
+          </div>
+          <div class="checklist-builder-actions">
+            <button class="btn-secondary" id="btn-reset-checklist">Сбросить к стандарту Freedom</button>
+            <button class="btn-primary" id="btn-add-criterion">+ Добавить критерий</button>
+            <button class="btn-primary" id="btn-apply-checklist-changes" style="background: var(--primary-dark);">Применить к диалогам и пересчитать</button>
+          </div>
+        </div>
+
+        <div class="data-table-card">
+          <table class="custom-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Секция</th>
+                <th>Критерий</th>
+                <th>Тип ответа</th>
+                <th>Вес</th>
+                <th>N/A доступен</th>
+                <th>Шкала / Описание</th>
+                <th>Действия</th>
+              </tr>
+            </thead>
+            <tbody id="checklist-table-body">
+              <!-- Rendered dynamically -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 4: 5-MINUTE PITCH GUIDE -->
+    <div class="tab-content" id="tab-pitch">
+      <div class="pitch-view-container">
+        <div class="view-header">
+          <div>
+            <h2>Сценарий защиты за 5 минут (Регламент хакатона)</h2>
+            <p>Пошаговый пульт для демонстрации решения жюри согласно таймингу из задания</p>
+          </div>
+        </div>
+
+        <div class="pitch-grid">
+          <!-- STEP 1 -->
+          <div class="pitch-step-card active-step">
+            <span class="step-time-badge">1 минута</span>
+            <h3>1. Интерфейс и диалог</h3>
+            <p>Покажите единый рабочий стол: список диалогов, фильтрацию по языкам (RU, KZ, EN), номер реплики у каждого сообщения, понятную навигацию.</p>
+            <button class="pitch-action-btn" onclick="demoStep1()">Показать типовой диалог (p1-ru-001) ↗</button>
+          </div>
+
+          <!-- STEP 2 -->
+          <div class="pitch-step-card">
+            <span class="step-time-badge">2 минуты</span>
+            <h3>2. Оценка, цитаты и N/A</h3>
+            <p>Покажите карточку оценки: расчет весов, клик по цитате с мгновенным переходом и подсветкой реплики, а также пример N/A и перерасчета весов.</p>
+            <button class="pitch-action-btn" onclick="demoStep2()">Показать N/A и переход к цитате (p1-ru-025) ↗</button>
+          </div>
+
+          <!-- STEP 3 -->
+          <div class="pitch-step-card">
+            <span class="step-time-badge">1 минута</span>
+            <h3>3. Апелляция и пересмотр</h3>
+            <p>Покажите процесс оспаривания оценки оператором, панель проверяющего (QC), принятие решения и автоматический пересчет итогового балла.</p>
+            <button class="pitch-action-btn" onclick="demoStep3()">Показать апелляцию (p1-ru-014) ↗</button>
+          </div>
+
+          <!-- STEP 4 -->
+          <div class="pitch-step-card">
+            <span class="step-time-badge">1 минута</span>
+            <h3>4. Замена критерия</h3>
+            <p>Покажите изменение чек-листа в интерфейсе и его мгновенное применение к выданным диалогам (главное контрольное задание 23-го часа!).</p>
+            <button class="pitch-action-btn" onclick="demoStep4()">Перейти в конструктор чек-листа ↗</button>
+          </div>
+        </div>
+
+        <div class="data-table-card" style="padding: 20px; background: #ffffff;">
+          <h3 style="margin-bottom: 10px;">⚡ Быстрый переход к контрольным кейсам хакатона:</h3>
+          <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+            <button class="btn-secondary" onclick="app.selectConversation('p1-ru-001')">💬 Идеальный чат RU (p1-ru-001)</button>
+            <button class="btn-secondary" onclick="app.selectConversation('p1-kz-001')">🇰🇿 Казахский диалог (p1-kz-001)</button>
+            <button class="btn-secondary" onclick="app.selectConversation('p1-en-001')">🇬🇧 Английский диалог (p1-en-001)</button>
+            <button class="btn-secondary" onclick="app.selectConversation('p4-ru-003')">📞 Реальный звонок с аудио (p4-ru-003)</button>
+            <button class="btn-secondary" onclick="app.selectConversation('p1-ru-022')">🚨 Грубая ошибка оператора (p1-ru-022)</button>
+            <button class="btn-secondary" onclick="app.selectConversation('p1-ru-025')">🔄 Чат с N/A и перерасчетом (p1-ru-025)</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- MODAL: SUBMIT OPERATOR APPEAL -->
+  <div class="modal-overlay" id="appeal-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>Подача апелляции оператора</h3>
+        <button class="close-btn" onclick="app.closeModal('appeal-modal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Критерий для оспаривания:</label>
+          <input type="text" id="appeal-modal-criterion" class="form-control" readonly>
+          <input type="hidden" id="appeal-modal-criterion-id">
+        </div>
+        <div class="form-group">
+          <label>Текущая оценка ИИ:</label>
+          <input type="text" id="appeal-modal-current-score" class="form-control" readonly>
+        </div>
+        <div class="form-group">
+          <label>Комментарий оператора (аргументация):</label>
+          <textarea id="appeal-modal-comment" class="form-control" placeholder="Опишите, почему вы считаете оценку некорректной и укажите номер реплики..."></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" onclick="app.closeModal('appeal-modal')">Отмена</button>
+        <button class="btn-primary" id="btn-submit-appeal">Отправить апелляцию</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: SUPERVISOR REVIEW DECISION -->
+  <div class="modal-overlay" id="review-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>Решение проверяющего (QC Review)</h3>
+        <button class="close-btn" onclick="app.closeModal('review-modal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Диалог и критерий:</label>
+          <input type="text" id="review-modal-target" class="form-control" readonly>
+          <input type="hidden" id="review-modal-conv-id">
+          <input type="hidden" id="review-modal-criterion-id">
+        </div>
+        <div class="form-group">
+          <label>Комментарий оператора:</label>
+          <div id="review-modal-operator-comment" style="font-size: 12px; background: #fffbeb; padding: 8px 10px; border-radius: 6px; border: 1px solid #fde68a;"></div>
+        </div>
+        <div class="form-group">
+          <label>Решение проверяющего:</label>
+          <select id="review-modal-decision-type" class="form-control">
+            <option value="change">Изменить оценку и пересчитать балл</option>
+            <option value="confirm">Подтвердить исходную оценку ИИ</option>
+          </select>
+        </div>
+        <div class="form-group" id="review-new-answer-group">
+          <label>Новая оценка:</label>
+          <select id="review-modal-new-answer" class="form-control">
+            <option value="yes">Да (полный балл)</option>
+            <option value="no">Нет (0 баллов)</option>
+            <option value="na">N/A (исключить и перераспределить вес)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Обоснование решения проверяющего:</label>
+          <textarea id="review-modal-reason" class="form-control" placeholder="Укажите причину подтверждения или изменения оценки..."></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" onclick="app.closeModal('review-modal')">Отмена</button>
+        <button class="btn-primary" id="btn-apply-review-decision">Сохранить решение</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: EDIT / ADD CHECKLIST CRITERION -->
+  <div class="modal-overlay" id="criterion-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 id="criterion-modal-title">Редактирование критерия</h3>
+        <button class="close-btn" onclick="app.closeModal('criterion-modal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>ID критерия (уникальный):</label>
+          <input type="text" id="crit-edit-id" class="form-control">
+        </div>
+        <div class="form-group">
+          <label>Название критерия:</label>
+          <input type="text" id="crit-edit-title" class="form-control">
+        </div>
+        <div class="form-group">
+          <label>Секция:</label>
+          <select id="crit-edit-section" class="form-control">
+            <option value="Начало и понимание запроса">Начало и понимание запроса</option>
+            <option value="Безопасность и решение">Безопасность и решение</option>
+            <option value="Ведение и завершение диалога">Ведение и завершение диалога</option>
+            <option value="Грубые нарушения">Грубые нарушения</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Тип ответа:</label>
+          <select id="crit-edit-type" class="form-control">
+            <option value="yes_no">Да / Нет</option>
+            <option value="scale">Числовая шкала</option>
+            <option value="flag">Флаг грубой ошибки (без баллов)</option>
+          </select>
+        </div>
+        <div class="form-group" id="crit-edit-weight-group">
+          <label>Вес критерия:</label>
+          <input type="number" id="crit-edit-weight" class="form-control" min="0" max="100">
+        </div>
+        <div class="form-group">
+          <label>
+            <input type="checkbox" id="crit-edit-allow-na"> Разрешить оценку N/A (неприменимо)
+          </label>
+        </div>
+        <div class="form-group">
+          <label>Инструкция по оценке:</label>
+          <textarea id="crit-edit-instruction" class="form-control"></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" onclick="app.closeModal('criterion-modal')">Отмена</button>
+        <button class="btn-primary" id="btn-save-criterion">Сохранить критерий</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SCRIPT INCLUDES -->
+  <script src="mock_data.js"></script>
+  <script src="checklists.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
