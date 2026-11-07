@@ -1379,7 +1379,7 @@ body { flex-direction: row; background: var(--page-bg); }
 .analysis-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
 .transcript-card, .quality-card { padding: 20px 22px; }
 .transcript-card .card-title { margin-bottom: 8px; }
-.transcript-card .chat-stream { padding: 0; gap: 0; max-height: 520px; overflow-y: auto; }
+.transcript-card .chat-stream { padding: 0; gap: 0; max-height: 520px; overflow-y: auto; position: relative; }
 
 /* transcript rows (mockup style) */
 .chat-stream .chat-message-row { align-items: stretch !important; border-top: 1px solid #eceeed; border-radius: 0; padding: 12px 14px; margin: 0; cursor: pointer; }
