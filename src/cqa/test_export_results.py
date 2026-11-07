@@ -5,6 +5,7 @@ Run: python3 -m unittest -v test_export_results   (the server cache test needs .
 import copy
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -238,6 +239,77 @@ class ServerCacheTest(unittest.TestCase):
             _, decided, _ = ex._from_row(app, cached, include_decisions=True)
             self.assertEqual(original["closing"], "yes")
             self.assertEqual(decided["closing"], "no")
+
+
+class PickRowTest(unittest.TestCase):
+    def test_pick_row(self):
+        rows = [{"model": "claude-opus-5-5", "id": 2}, {"model": "claude-sonnet-5-5", "id": 1}]  # newest first
+        self.assertEqual(ex.pick_row(rows, None), (rows[0], None))
+        self.assertEqual(ex.pick_row(rows, "claude-sonnet-5-5"), (rows[1], None))
+        self.assertEqual(ex.pick_row(rows, "gemini-x"), (None, rows[0]))
+        self.assertEqual(ex.pick_row([], "gemini-x"), (None, None))
+
+
+@unittest.skipUnless(importlib.util.find_spec("fastapi") and sys.version_info >= (3, 10),
+                     "server needs Python 3.10+ with server/requirements.txt (.venv)")
+class RequireModelTest(unittest.TestCase):
+    """A cached evaluation by another model is re-evaluated by the required one; no network (llm.call is faked)."""
+
+    def test_other_model_is_reevaluated_by_required(self):
+        if str(ROOT) not in sys.path:
+            sys.path.insert(0, str(ROOT))
+        import evaluator
+        import llm
+        import server.app as app
+        import server.evaluations as evaluations
+        record = {"conversation_id": "test-model-1", "channel": "agent chat", "language": "RU",
+                  "transcript": [{"timestamp": "00:01", "speaker": "client", "text": "Где тариф?"},
+                                 {"timestamp": "00:20", "speaker": "operator", "text": "Здравствуйте! В профиле."},
+                                 {"timestamp": "00:30", "speaker": "operator", "text": "Всего доброго!"}]}
+        answers = {"contact": "yes", "needs": "na", "identification": "na", "consultation": "15", "empathy": "yes",
+                   "dialog_management": "7", "closing": "no", "gross_errors": "no"}
+        reply = json.dumps({cid: {"explanation": "тест", "evidence": {"message_index": 1, "quote": "В профиле."},
+                                  "answer": a} for cid, a in answers.items()}, ensure_ascii=False)
+
+        def opus_engine(rec, checklist):  # an older evaluation made by a fallback model
+            details = {c["id"]: {"explanation": "старое", "evidence": []} for c in checklist["criteria"]}
+            res = evaluator.build_result({**rec, "conversation_id": rec["id"]}, checklist,
+                                         {**answers, "consultation": 20.0}, details, "claude-opus-5-5", 0.03)
+            return res, {"seconds": 0.1, "input_tokens": 1, "output_tokens": 1}
+
+        quiet = lambda *a, **k: None  # noqa: E731
+        env_before = os.environ.get("EVAL_MODELS")
+        original_evaluate = evaluator.evaluate
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(app, "DB_PATH", Path(tmp) / "t.sqlite3"), \
+                mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key",
+                                             "EVAL_MODELS": "claude-sonnet-5-5,claude-opus-5-5"}):
+            app._init_db()
+            app.create_conversation(record)
+            std_id = ex.standard_checklists()["agent chat"][0]
+            with mock.patch.object(evaluations, "_run_engine", side_effect=opus_engine):
+                self.assertIsNone(ex._evaluate(evaluations, "test-model-1", std_id))
+            fake = llm.LLMResult(reply, 1000, 200, 0.5, 0.004, {"effort": "low"})
+            with mock.patch("llm.call", return_value=fake) as call:
+                info = ex.collect(app, evaluations, [record], required="claude-sonnet-5-5", log=quiet)
+                self.assertEqual(info["other"], {"test-model-1": "claude-opus-5-5"})
+                self.assertEqual(info["missing"], ["test-model-1"])
+                self.assertEqual(call.call_count, 1)
+                self.assertEqual(call.call_args[0][0].name, "claude-sonnet-5-5")  # forced model, no fallback chain
+                self.assertEqual(dict(info["by_model"]), {"claude-sonnet-5-5": 1})
+                self.assertEqual(info["results"][0]["criteria"][3]["value"], 15)  # new answer, not opus's 20
+                self.assertEqual(os.environ["EVAL_MODELS"], "claude-sonnet-5-5,claude-opus-5-5")  # restored
+                self.assertIs(evaluator.evaluate, original_evaluate)  # restored after the export
+
+                again = ex.collect(app, evaluations, [record], required="claude-sonnet-5-5", log=quiet)
+                self.assertEqual((again["missing"], call.call_count), ([], 1))  # now cached, not paid again
+                anyone = ex.collect(app, evaluations, [record], required=None, log=quiet)
+                self.assertEqual(anyone["missing"], [])
+                stopped = ex.collect(app, evaluations, [record], required="gemini-3.5-flash-lite",
+                                     only_cached=True, log=quiet)
+                self.assertTrue(stopped["stopped"])
+                self.assertEqual(call.call_count, 1)
+        self.assertEqual(os.environ.get("EVAL_MODELS"), env_before)
 
 
 if __name__ == "__main__":

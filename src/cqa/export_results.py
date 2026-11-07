@@ -22,7 +22,9 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -163,13 +165,54 @@ def _server():
     return app, evaluations
 
 
-def server_cache_key(record: dict, row) -> str:
-    """Exactly the key server/evaluations.py create_evaluation uses."""
+def server_cache_key(record: dict, row, models: Optional[str] = None) -> str:
+    """Exactly the key server/evaluations.py create_evaluation uses.
+
+    Note: the key holds the model CHAIN (EVAL_MODELS), not the model that actually answered:
+    after a fallback, a row under the same key may come from another model. See --require-model.
+    """
     checklist = json.loads(row["checklist_json"])
+    chain = os.environ.get("EVAL_MODELS", "") if models is None else models
     source = json.dumps({"conversation_id": record["id"], "transcript": record["transcript"], "language": record["language"],
                          "channel": record["channel"], "checklist": checklist, "checklist_id": row["id"],
-                         "models": os.environ.get("EVAL_MODELS", "")}, sort_keys=True, ensure_ascii=False)
+                         "models": chain}, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def pick_row(rows: list, required: Optional[str]) -> tuple[Optional[Any], Optional[Any]]:
+    """(newest row made by the required model, or None; newest row by another model, for reporting)."""
+    for r in rows:
+        if required is None or r["model"] == required:
+            return r, None
+    return None, (rows[0] if rows else None)
+
+
+@contextmanager
+def forced_model(model: Optional[str]):
+    """Inside this process only: evaluate with exactly `model` (no fallback) and give it its own cache key.
+
+    The server code is not changed: EVAL_MODELS in os.environ (part of the server's cache key) is set to the
+    model, and evaluator.evaluate gets the model explicitly. Both are restored afterwards.
+    """
+    if not model:
+        yield
+        return
+    import evaluator
+    old_env, old_evaluate = os.environ.get("EVAL_MODELS"), evaluator.evaluate
+
+    def evaluate(record, checklist=None, model_name=None, **kwargs):
+        return old_evaluate(record, checklist, model_name or model, **kwargs)
+
+    os.environ["EVAL_MODELS"] = model
+    evaluator.evaluate = evaluate
+    try:
+        yield
+    finally:
+        evaluator.evaluate = old_evaluate
+        if old_env is None:
+            os.environ.pop("EVAL_MODELS", None)
+        else:
+            os.environ["EVAL_MODELS"] = old_env
 
 
 def _active_checklist(app, channel: str):
@@ -223,9 +266,16 @@ def checklist_warnings(app) -> list[str]:
 
 def _cached_row(app, key: str):
     """Latest successful evaluation with this key, including ones that later got appeals."""
+    rows = _candidate_rows(app, [key])
+    return rows[0] if rows else None
+
+
+def _candidate_rows(app, keys: list[str]) -> list:
+    """Successful evaluations under any of these keys, newest first (appealed ones included)."""
     with app._connect() as db:
-        return db.execute("""SELECT * FROM evaluations WHERE cache_key = ? AND model != 'ERROR'
-            ORDER BY rowid DESC LIMIT 1""", (key,)).fetchone()
+        marks = ",".join("?" * len(keys))
+        return db.execute(f"""SELECT * FROM evaluations WHERE cache_key IN ({marks}) AND model != 'ERROR'
+            ORDER BY rowid DESC""", list(keys)).fetchall()
 
 
 def _from_row(app, row, include_decisions: bool) -> tuple[dict, dict, dict]:
@@ -255,6 +305,96 @@ def _evaluate(evaluations, conversation_id: str, checklist_id: str) -> Optional[
         except ValueError:
             return "ошибка оценки"
     return None if isinstance(out, dict) and out.get("status") != "error" else (out.get("error") or "ошибка оценки")
+
+
+def collect(app, evaluations, records: list[dict], *, required: Optional[str], only_cached: bool = False,
+            workers: int = 4, include_decisions: bool = False, log=print) -> dict:
+    """Find or make one evaluation per dialog (standard checklist, `required` model) and convert them.
+
+    Returns {"stopped", "results", "models", "items", "missing", "other", "new_cost", "by_model"}.
+    stopped=True means only_cached and something is missing (nothing is evaluated then).
+    """
+    errors: dict[str, str] = {}
+    keys: dict[str, list[str]] = {}       # conversation_id -> cache keys to look in
+    checklist_of: dict[str, str] = {}     # conversation_id -> standard checklist id
+    used_checklists = set()
+    for w in checklist_warnings(app):
+        log("ВНИМАНИЕ:", w)
+    for rec in records:
+        cid = str(rec.get("conversation_id") or "")
+        try:
+            app.create_conversation(rec)  # same storage the server uses (upsert)
+            db_rec = app.get_conversation(cid)
+            row = _standard_checklist(app, db_rec["channel"])
+        except Exception as e:  # noqa: BLE001
+            errors[cid] = str(e) if isinstance(e, ExportError) else f"некорректный диалог: {getattr(e, 'detail', None) or e}"
+            continue
+        used_checklists.add(f"{row['id']} ({row['applies_to']})")
+        checklist_of[cid] = row["id"]
+        keys[cid] = [server_cache_key(db_rec, row)]
+        if required:  # evaluations made earlier by --require-model live under the one-model chain key
+            own = server_cache_key(db_rec, row, required)
+            if own not in keys[cid]:
+                keys[cid].append(own)
+    log(f"диалогов: {len(records)}; чек-листы выгрузки (стандартные): {', '.join(sorted(used_checklists))}")
+
+    chosen, other = {}, {}
+    for cid, ks in keys.items():
+        row, other_row = pick_row(_candidate_rows(app, ks), required)
+        if row is not None:
+            chosen[cid] = row
+        elif other_row is not None:
+            other[cid] = other_row["model"]
+    missing = [cid for cid in keys if cid not in chosen]
+    log(f"в кэше ({required or 'любой моделью'}): {len(chosen)}, нужно оценить: {len(missing)}")
+    if other:
+        kinds = ", ".join(f"{m}: {n}" for m, n in Counter(other.values()).most_common())
+        log(f"ВНИМАНИЕ: {len(other)} оценок в кэше сделаны другой моделью ({kinds}); "
+            f"они будут переоценены моделью {required} — это платно")
+    if only_cached and missing:
+        log(f"Остановлено (--only-cached): нет подходящей оценки для {len(missing)} диалогов:")
+        log("  " + ", ".join(f"{cid} (есть оценка {other[cid]})" if cid in other else cid for cid in missing))
+        return {"stopped": True, "missing": missing, "other": other}
+
+    if missing:
+        started = time.time()
+
+        def work(cid):
+            t = time.time()
+            err = _evaluate(evaluations, cid, checklist_of[cid])
+            log(f"  {cid:14} {'ok' if err is None else 'ошибка: ' + err[:80]} ({time.time() - t:.1f} с)", flush=True)
+            return cid, err
+
+        with forced_model(required), ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            for cid, err in pool.map(work, missing):
+                if err:
+                    errors[cid] = err
+        log(f"оценено за {time.time() - started:.0f} с")
+
+    results, models, items, new_cost = [], [], [], 0.0
+    by_model: Counter = Counter()
+    for rec in records:
+        cid = str(rec.get("conversation_id") or "")
+        if cid in errors:
+            results.append(error_record(cid, errors[cid]))
+            continue
+        row = chosen.get(cid) or pick_row(_candidate_rows(app, keys[cid]), required)[0]
+        if row is None:
+            results.append(error_record(cid, f"нет оценки моделью {required} после запуска"))
+            continue
+        try:
+            checklist, answers, details = _from_row(app, row, include_decisions)
+            results.append(ok_record(cid, checklist, answers, details))
+        except (ExportError, ValueError, KeyError) as e:
+            results.append(error_record(cid, f"не удалось выгрузить оценку: {e}"))
+            continue
+        models.append(row["model"])
+        by_model[row["model"]] += 1
+        items.append({"conversation_id": cid, "details": details})
+        if cid in missing and row["cost_usd"]:
+            new_cost += row["cost_usd"]
+    return {"stopped": False, "results": results, "models": models, "items": items, "missing": missing,
+            "other": other, "new_cost": new_cost, "by_model": by_model}
 
 
 # ---------- sources ----------
@@ -302,6 +442,9 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=4, help="parallel evaluations (default 4)")
     ap.add_argument("--include-decisions", action="store_true",
                     help="use answers after reviewers' decisions (default: model's original answers)")
+    ap.add_argument("--require-model",
+                    help="use only evaluations made by this model; others are re-evaluated by it (paid). "
+                         "Default: first model in EVAL_MODELS; 'any' accepts any model")
     ap.add_argument("--check-evidence", action="store_true", help="check that quotes are in transcript[turn-1]")
     ap.add_argument("--validate", action="store_true", help="validate the written file")
     args = ap.parse_args()
@@ -309,73 +452,17 @@ def main() -> None:
     records, source_path = load_source(args)
     app, evaluations = _server()
     team = os.environ.get("TEAM_NAME", "").strip() or DEFAULT_TEAM
-    errors: dict[str, str] = {}
-    plan: dict[str, Optional[str]] = {}  # conversation_id -> cache key
-    checklist_of: dict[str, str] = {}    # conversation_id -> standard checklist id
-    used_checklists = set()
-    for w in checklist_warnings(app):
-        print("ВНИМАНИЕ:", w)
-    for rec in records:
-        cid = str(rec.get("conversation_id") or "")
-        try:
-            app.create_conversation(rec)  # same storage the server uses (upsert)
-            db_rec = app.get_conversation(cid)
-        except Exception as e:  # noqa: BLE001
-            errors[cid] = f"некорректный диалог: {getattr(e, 'detail', None) or e}"
-            plan[cid] = None
-            continue
-        try:
-            row = _standard_checklist(app, db_rec["channel"])
-        except ExportError as e:
-            errors[cid] = str(e)
-            plan[cid] = None
-            continue
-        used_checklists.add(f"{row['id']} ({row['applies_to']})")
-        checklist_of[cid] = row["id"]
-        plan[cid] = server_cache_key(db_rec, row)
-    print(f"диалогов: {len(records)}; чек-листы выгрузки (стандартные): {', '.join(sorted(used_checklists))}")
-
-    missing = [cid for cid, key in plan.items() if key and _cached_row(app, key) is None]
-    print(f"в кэше: {len(plan) - len(missing) - len(errors)}, нужно оценить: {len(missing)}")
-    if args.only_cached and missing:
-        print(f"Остановлено (--only-cached): нет в кэше {len(missing)} диалогов:")
-        print("  " + ", ".join(missing))
+    chain = [m.strip() for m in os.environ.get("EVAL_MODELS", "").split(",") if m.strip()]
+    if args.require_model == "any":
+        required = None
+    else:
+        required = args.require_model or (chain[0] if chain else None)
+    print(f"нужная модель: {required or 'любая'}")
+    info = collect(app, evaluations, records, required=required, only_cached=args.only_cached,
+                   workers=args.workers, include_decisions=args.include_decisions)
+    if info["stopped"]:
         sys.exit(2)
-
-    if missing:
-        started = time.time()
-
-        def work(cid):
-            t = time.time()
-            err = _evaluate(evaluations, cid, checklist_of[cid])
-            print(f"  {cid:14} {'ok' if err is None else 'ошибка: ' + err[:80]} ({time.time() - t:.1f} с)", flush=True)
-            return cid, err
-
-        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-            for cid, err in pool.map(work, missing):
-                if err:
-                    errors[cid] = err
-        print(f"оценено за {time.time() - started:.0f} с")
-
-    results, models, items, new_cost = [], [], [], 0.0
-    for rec in records:
-        cid = str(rec.get("conversation_id") or "")
-        if cid in errors:
-            results.append(error_record(cid, errors[cid]))
-            continue
-        row = _cached_row(app, plan[cid])
-        if row is None:
-            results.append(error_record(cid, "оценка не найдена после запуска"))
-            continue
-        try:
-            checklist, answers, details = _from_row(app, row, args.include_decisions)
-            results.append(ok_record(cid, checklist, answers, details))
-            models.append(row["model"])
-            items.append({"conversation_id": cid, "details": details})
-            if cid in missing and row["cost_usd"]:
-                new_cost += row["cost_usd"]
-        except (ExportError, ValueError, KeyError) as e:
-            results.append(error_record(cid, f"не удалось выгрузить оценку: {e}"))
+    results, models, items, missing, new_cost = (info[k] for k in ("results", "models", "items", "missing", "new_cost"))
 
     doc = build_document(team, models, results, os.environ.get("EVAL_MODELS", "") or "unknown")
     out = Path(args.out) if args.out else ROOT / "results" / args.set / "results.json"
@@ -385,6 +472,8 @@ def main() -> None:
     print(f"записано: {out} — записей {len(results)}, ok {len(results) - n_err}, error {n_err}; "
           f"модели: {doc['model']['name']}; ответы: {'после решений' if args.include_decisions else 'исходные модели'}"
           + (f"; стоимость новых оценок ${new_cost:.4f}" if missing else ""))
+    by_model = ", ".join(f"{m}: {n}" for m, n in info["by_model"].most_common()) or "нет"
+    print(f"оценок по моделям: {by_model}; ошибок: {n_err}")
 
     if args.check_evidence:
         dialogs = {str(r["conversation_id"]): r for r in records}
