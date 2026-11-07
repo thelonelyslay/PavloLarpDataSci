@@ -284,6 +284,7 @@
   }
 
   async function selectConversation(cid, quiet) {
+    if (state.activeConvId !== cid) state.selCrit = null;
     state.activeConvId = cid;
     if (!quiet) renderConversationsList();
 
@@ -354,29 +355,33 @@
     const voiceBar = document.getElementById('voice-audio-bar');
     const streamEl = document.getElementById('chat-stream');
 
-    if (titleEl) {
-      titleEl.innerHTML = `
-        <span>${escapeHtml(conv.conversation_id)}</span>
-        <span class="badge ${conv.channel === 'voice call' ? 'badge-voice' : 'badge-chat'}">${escapeHtml(conv.channel)}</span>
-        <span class="badge badge-${String(conv.language || '').toLowerCase()}">${escapeHtml(conv.language)}</span>
-      `;
-    }
+    const isVoice = conv.channel === 'voice call';
+    const LANG = { RU: 'Русский', KZ: 'Казахский', EN: 'English' };
+    const offs = messageOffsets(conv);
+    const dur = conversationDuration(conv, offs);
     if (subEl) {
-      const msgCount = conv.transcript ? conv.transcript.length : 0;
-      subEl.textContent = `Всего реплик: ${msgCount} · Исходный канал: ${conv.channel}`;
+      subEl.textContent = `${isVoice ? 'Звонок' : 'Чат'} ${conv.conversation_id} · ${LANG[conv.language] || conv.language || '—'}` +
+        (dur ? ` · ${formatSec(dur)}` : '') + ` · ${conv.transcript ? conv.transcript.length : 0} реплик`;
     }
+    if (titleEl) titleEl.innerHTML = '';
+    document.body.classList.toggle('is-chat', !isVoice);
 
-    // Audio Bar for Voice Calls
-    if (voiceBar) {
-      if (conv.channel === 'voice call' && conv.audio_url) {
-        voiceBar.style.display = 'flex';
-        const extLink = document.getElementById('audio-external-link');
-        if (extLink) extLink.href = conv.audio_url;
-        setupVoiceAudio(conv.audio_url);
-      } else {
-        voiceBar.style.display = 'none';
-      }
+    // Player: real audio for calls; for chats only the timeline
+    const audio = document.getElementById('html5-audio-element');
+    const playBtn = document.getElementById('audio-play-btn');
+    const extLink = document.getElementById('audio-external-link');
+    if (isVoice && conv.audio_url) {
+      if (extLink) extLink.href = conv.audio_url;
+      setupVoiceAudio(conv.audio_url, dur);
+      if (playBtn) playBtn.disabled = false;
+    } else {
+      if (audio) { audio.pause(); audio.removeAttribute('src'); }
+      if (playBtn) { playBtn.disabled = true; playBtn.textContent = '▶'; }
+      setText('audio-time-current', '00:00');
+      setText('audio-time-duration', formatSec(dur || 0));
+      const seek = document.getElementById('audio-seek'); if (seek) seek.value = 0;
     }
+    renderTimeline(conv);
 
     // Render messages with replica numbers (#0, #1, #2, ...)
     if (streamEl) {
@@ -395,11 +400,13 @@
         else if (msg.speaker === 'bot') speakerLabel = 'Бот';
         else if (msg.speaker === 'system') speakerLabel = 'Система';
 
+        row.dataset.i = idx;
+        row.onclick = () => { seekAudioToReplica(idx); highlightTimeline([idx, idx]); };
         row.innerHTML = `
           <div class="msg-header">
+            <span class="msg-time">${escapeHtml(formatTimestamp(msg.timestamp, offs[idx]))}</span>
+            <span class="speaker-tag speaker-${escapeHtml(msg.speaker)}">${speakerLabel}</span>
             <span class="replica-badge">#${idx}</span>
-            <span class="speaker-tag speaker-${msg.speaker}">${speakerLabel}</span>
-            <span class="msg-time">${formatTimestamp(msg.timestamp)}</span>
           </div>
           <div class="msg-bubble">${escapeHtml(msg.text)}</div>
         `;
@@ -408,7 +415,7 @@
     }
   }
 
-  function setupVoiceAudio(audioUrl) {
+  function setupVoiceAudio(audioUrl, fallbackDur) {
     const playBtn = document.getElementById('audio-play-btn');
     const seekInput = document.getElementById('audio-seek');
     const curTime = document.getElementById('audio-time-current');
@@ -417,7 +424,11 @@
     const audio = document.getElementById('html5-audio-element');
 
     if (!audio) return;
-    audio.src = audioUrl;
+    if (audio.getAttribute('src') !== audioUrl) audio.src = audioUrl;
+    if (playBtn) playBtn.textContent = audio.paused ? '▶' : '⏸';
+    if (durTime) durTime.textContent = formatSec(fallbackDur || 0);
+    audio.onended = () => { if (playBtn) playBtn.textContent = '▶'; };
+    audio.onerror = () => { const n = document.getElementById('tl-note'); if (n) n.textContent = 'Запись не воспроизводится в браузере — откройте её по ссылке ↗. Полосы построены по меткам времени реплик.'; };
 
     if (playBtn) {
       playBtn.onclick = () => {
@@ -432,11 +443,15 @@
     }
 
     audio.ontimeupdate = () => {
-      if (audio.duration) {
-        const pct = (audio.currentTime / audio.duration) * 100;
+      const total = audio.duration || fallbackDur;
+      if (total) {
+        const pct = (audio.currentTime / total) * 100;
         if (seekInput) seekInput.value = pct;
         if (curTime) curTime.textContent = formatSec(audio.currentTime);
-        if (durTime) durTime.textContent = formatSec(audio.duration);
+        if (durTime) durTime.textContent = formatSec(total);
+        const ph = document.getElementById('tl-playhead');
+        const lanes = document.getElementById('lane-client');
+        if (ph && lanes) { ph.style.display = 'block'; ph.style.left = (lanes.offsetLeft + lanes.offsetWidth * Math.min(1, pct / 100)) + 'px'; }
       }
     };
 
@@ -453,6 +468,89 @@
         audio.playbackRate = Number(speedSel.value);
       };
     }
+  }
+
+  // --- TIMELINE: who spoke when (built from replica timestamps) ---
+  function tsToSec(ts) {
+    if (!ts) return null;
+    if (/^\d{1,2}:\d{2}(:\d{2})?$/.test(ts)) { const p = ts.split(':').map(Number); return p.length === 3 ? p[0] * 3600 + p[1] * 60 + p[2] : p[0] * 60 + p[1]; }
+    const d = Date.parse(ts); return isNaN(d) ? null : d / 1000;
+  }
+  function messageOffsets(conv) {
+    const t = (conv.transcript || []).map(m => tsToSec(m.timestamp));
+    const base = t.find(x => x !== null);
+    return t.map(x => (x === null || base === undefined) ? null : Math.max(0, x - base));
+  }
+  // Estimated speaking time of a replica: ~15 characters per second, 1.5 s minimum
+  const speakSec = m => Math.max(1.5, (m.text || '').length / 15);
+  function conversationDuration(conv, offs) {
+    const tr = conv.transcript || [];
+    let end = 0;
+    tr.forEach((m, i) => { if (offs[i] !== null) end = Math.max(end, offs[i] + (m.speaker === 'system' ? 0 : speakSec(m))); });
+    return end;
+  }
+  function messageSpans(conv) {
+    const offs = messageOffsets(conv);
+    const tr = conv.transcript || [];
+    return tr.map((m, i) => {
+      if (offs[i] === null) return null;
+      let next = null;
+      for (let k = i + 1; k < tr.length; k++) if (offs[k] !== null && offs[k] > offs[i]) { next = offs[k]; break; }
+      const end = offs[i] + speakSec(m);
+      return [offs[i], next !== null ? Math.min(end, next) : end];
+    });
+  }
+  // On a long chat a short replica would be a hairline: give every replica at least ~1.5% of the width
+  function visualSpans(spans, dur) {
+    const minW = dur * 0.015;
+    return spans.map(sp => sp ? [sp[0], Math.max(sp[1], sp[0] + minW)] : null);
+  }
+  const BAR_COUNT = 140;
+  function renderTimeline(conv) {
+    const spans = messageSpans(conv);
+    const offs = messageOffsets(conv);
+    const dur = conversationDuration(conv, offs) || 1;
+    const tr = conv.transcript || [];
+    const vis = visualSpans(spans, dur);
+    const lanes = { client: document.getElementById('lane-client'), operator: document.getElementById('lane-operator') };
+    for (const role of ['client', 'operator']) {
+      const el = lanes[role];
+      if (!el) continue;
+      let html = '';
+      for (let k = 0; k < BAR_COUNT; k++) {
+        const t0 = k / BAR_COUNT * dur, t1 = (k + 1) / BAR_COUNT * dur;
+        const i = tr.findIndex((m, j) => m.speaker === role && vis[j] && vis[j][0] < t1 && vis[j][1] > t0);
+        if (i >= 0) {
+          // bar height varies deterministically with the replica text, only for visual rhythm
+          const code = (tr[i].text.charCodeAt((k * 7) % tr[i].text.length) || 60) + k * 13 + i * 31;
+          const h = 30 + (code % 70);
+          html += `<i class="on" data-i="${i}" style="height:${h}%"></i>`;
+        } else html += '<i></i>';
+      }
+      el.innerHTML = html;
+      el.onclick = (e) => {
+        const rect = el.getBoundingClientRect();
+        const t = (e.clientX - rect.left) / rect.width * dur;
+        let best = -1, bd = Infinity;
+        tr.forEach((m, j) => { if (spans[j] && m.speaker !== 'system') { const d = Math.abs(spans[j][0] - t); if (d < bd) { bd = d; best = j; } } });
+        if (best >= 0) scrollToReplica(best);
+      };
+    }
+    const ph = document.getElementById('tl-playhead'); if (ph) ph.style.display = 'none';
+    state.timeline = { dur, spans: vis };
+    applyFocus();
+  }
+  function highlightTimeline(range) {
+    const hl = document.getElementById('tl-highlight');
+    const lane = document.getElementById('lane-client');
+    const tl = state.timeline;
+    if (!hl || !lane || !tl || !range) { if (hl) hl.style.display = 'none'; return; }
+    const a = tl.spans[range[0]], b = tl.spans[range[1]] || a;
+    if (!a) { hl.style.display = 'none'; return; }
+    const x0 = a[0] / tl.dur, x1 = Math.max(b[1], a[0]) / tl.dur;
+    hl.style.display = 'block';
+    hl.style.left = (lane.offsetLeft + lane.offsetWidth * x0 - 3) + 'px';
+    hl.style.width = Math.max(10, lane.offsetWidth * (x1 - x0) + 6) + 'px';
   }
 
   function formatSec(s) {
@@ -483,6 +581,7 @@
       setText('eval-cost-tag', 'Стоимость: —');
       setText('eval-version-tag', 'Чек-лист: —');
       if (demoTag) demoTag.style.display = 'none';
+      renderQualitySummary(null);
       if (criteriaContainer) {
         criteriaContainer.innerHTML = `<div class="empty-eval">Диалог ещё не оценён.<br>${isLive()
           ? 'Нажмите «▶ Оценить» над транскриптом — оценку выполнит сервер.'
@@ -495,7 +594,7 @@
     if (demoTag) demoTag.style.display = isDemo ? 'inline-block' : 'none';
     const cl = checklistOf(ev);
 
-    if (totalEl) totalEl.textContent = ev.total !== null && ev.total !== undefined ? fmt2(ev.total) : '—';
+    if (totalEl) totalEl.textContent = ev.total !== null && ev.total !== undefined ? fmtShort(ev.total) : '—';
 
     if (badgeEl) {
       const lvl = scoreLevel(ev.total);
@@ -546,6 +645,7 @@
     setText('eval-cost-tag', 'Стоимость: ' + (ev.cost_usd !== null && ev.cost_usd !== undefined ? '$' + Number(ev.cost_usd).toFixed(4) : '—'));
     setText('eval-version-tag', `Чек-лист: ${cl && cl.name ? cl.name + ' ' : ''}v${ev.checklist_version !== undefined ? ev.checklist_version : '—'}`);
 
+    renderQualitySummary(ev);
     if (!criteriaContainer) return;
     criteriaContainer.innerHTML = '';
     if (ev.status === 'error') {
@@ -562,7 +662,9 @@
       const origView = answerView(def, crit, orig);
       const isFlag = def ? def.type === 'flag' : crit.weight === 0;
       const card = document.createElement('div');
-      card.className = 'criterion-card';
+      card.className = 'criterion-card' + (state.selCrit === crit.id ? ' sel' : '');
+      card.dataset.crit = crit.id;
+      card.onclick = (e) => { if (!e.target.closest('button')) selectCriterion(crit.id); };
 
       const evidenceHtml = (crit.evidence || []).map(e => `
           <div class="evidence-row">
@@ -630,6 +732,120 @@
         <div class="criterion-footer">${appealHtml}</div>`;
       criteriaContainer.appendChild(card);
     });
+  }
+
+  // --- QUALITY SUMMARY (ring, short criteria list, "why", actions) ---
+  function critStatus(def, crit) {
+    const a = finalAnswer(crit);
+    const isFlag = def ? def.type === 'flag' : crit.weight === 0;
+    if (isFlag) return a === 'yes' ? 'flag' : 'ok';
+    if (a === 'na' || !crit.applicable) return 'na';
+    const pts = Number(crit.points) || 0, w = Number(crit.effective_weight) || 0;
+    if (w > 0 && pts >= w - 0.005) return 'ok';
+    return pts > 0.005 ? 'part' : 'bad';
+  }
+  function focusRange(crit) {
+    if (!crit) return null;
+    const idx = (crit.evidence || []).map(e => Number(e.message_index)).filter(n => !isNaN(n));
+    if (idx.length) return [Math.min(...idx), Math.max(...idx)];
+    if (Array.isArray(crit.checked_range) && crit.checked_range.length === 2) return [Number(crit.checked_range[0]), Number(crit.checked_range[1])];
+    return null;
+  }
+  function selectedCrit() {
+    const ev = state.evaluations[state.activeConvId];
+    return ev && (ev.criteria || []).find(c => c.id === state.selCrit) || null;
+  }
+
+  function renderQualitySummary(ev) {
+    const ring = document.getElementById('score-ring');
+    const list = document.getElementById('criteria-summary');
+    const C = 2 * Math.PI * 50;
+    if (ring) {
+      const t = ev ? ev.total : null;
+      ring.style.strokeDashoffset = (t === null || t === undefined) ? C : C * (1 - Math.max(0, Math.min(100, t)) / 100);
+      ring.setAttribute('class', 'ring-fg lvl-' + (ev && ev.gross_error ? 'low' : scoreLevel(t)));
+    }
+    if (!ev || ev.status === 'error') {
+      if (list) list.innerHTML = '';
+      state.selCrit = null;
+      applyFocus();
+      return;
+    }
+    const crits = ev.criteria || [];
+    // default selection: the first criterion that lost points (or a gross error flag)
+    if (!crits.find(c => c.id === state.selCrit)) {
+      const lost = crits.find(c => ['flag', 'bad', 'part'].includes(critStatus(critDef(ev, c.id), c)));
+      state.selCrit = (lost || crits[0] || {}).id || null;
+    }
+    const ICON = { ok: '✓', part: '≈', bad: '✕', na: 'N/A', flag: '!' };
+    if (list) {
+      list.innerHTML = crits.map(c => {
+        const def = critDef(ev, c.id);
+        const st = critStatus(def, c);
+        const isFlag = def ? def.type === 'flag' : c.weight === 0;
+        const pts = isFlag ? (finalAnswer(c) === 'yes' ? '<b>нарушение</b>' : 'нет')
+          : st === 'na' ? 'N/A' : `<b>${fmtShort(c.points)}</b> / ${fmtShort(c.effective_weight)}`;
+        return `<div class="cs-row cs-${st} ${c.id === state.selCrit ? 'sel' : ''}" data-crit="${escapeHtml(c.id)}" title="${escapeHtml(c.explanation || '')}">
+          <span class="cs-ico">${ICON[st]}</span><span class="cs-name">${escapeHtml(c.title)}</span><span class="cs-pts">${pts}</span></div>`;
+      }).join('');
+      list.querySelectorAll('.cs-row').forEach(r => { r.onclick = () => selectCriterion(r.dataset.crit); });
+    }
+    applyFocus();
+  }
+  function fmtShort(n) {
+    if (n === null || n === undefined || isNaN(n)) return '—';
+    return Number(n).toLocaleString('ru-RU', { maximumFractionDigits: 2 });
+  }
+
+  function selectCriterion(id) {
+    state.selCrit = id;
+    document.querySelectorAll('.cs-row').forEach(r => r.classList.toggle('sel', r.dataset.crit === id));
+    document.querySelectorAll('.criterion-card[data-crit]').forEach(r => r.classList.toggle('sel', r.dataset.crit === id));
+    applyFocus();
+    const range = focusRange(selectedCrit());
+    if (range) { const el = document.getElementById(`msg-${range[0]}`); if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+  }
+
+  // Highlights the selected criterion's evidence in the transcript and on the timeline, fills "why" and the buttons
+  function applyFocus() {
+    const ev = state.evaluations[state.activeConvId];
+    const crit = selectedCrit();
+    const range = focusRange(crit);
+    document.querySelectorAll('.chat-message-row.focus').forEach(r => r.classList.remove('focus'));
+    if (crit) {
+      const idx = new Set((crit.evidence || []).map(e => Number(e.message_index)));
+      if (!idx.size && range) for (let i = range[0]; i <= range[1]; i++) idx.add(i);
+      idx.forEach(i => { const r = document.getElementById(`msg-${i}`); if (r) r.classList.add('focus'); });
+    }
+    highlightTimeline(range);
+
+    const whyT = document.getElementById('why-title');
+    const whyX = document.getElementById('why-text');
+    const go = document.getElementById('btn-goto-fragment');
+    const dis = document.getElementById('btn-dispute');
+    if (!ev || !crit) {
+      if (whyT) whyT.textContent = 'Почему снижена оценка';
+      if (whyX) whyX.textContent = ev ? '—' : 'Диалог ещё не оценён.';
+      if (go) go.disabled = true;
+      if (dis) dis.disabled = true;
+      return;
+    }
+    const def = critDef(ev, crit.id);
+    const st = critStatus(def, crit);
+    const lostAny = (ev.criteria || []).some(c => ['bad', 'part', 'flag'].includes(critStatus(critDef(ev, c.id), c)));
+    if (whyT) whyT.textContent = st === 'ok' ? (lostAny ? 'Критерий выполнен' : 'Оценка не снижена') : st === 'na' ? 'Почему N/A' : st === 'flag' ? 'Грубая ошибка' : 'Почему снижена оценка';
+    if (whyX) {
+      const extra = st === 'na' ? (crit.na_reason || (def && def.na_condition) || '') : '';
+      whyX.innerHTML = `<span class="why-crit">${escapeHtml(crit.title)}:</span> ${escapeHtml(extra || crit.explanation || '—')}`;
+    }
+    if (go) { go.disabled = !range; go.onclick = () => range && scrollToReplica(range[0], range[1]); }
+    if (dis) {
+      const hasAppeal = Boolean(crit.appeal);
+      dis.disabled = hasAppeal || !isLive();
+      dis.textContent = hasAppeal ? (crit.appeal.status === 'open' ? 'Апелляция подана' : 'Апелляция рассмотрена') : 'Оспорить оценку';
+      dis.title = isLive() ? '' : 'Апелляции работают только с сервером';
+      dis.onclick = () => openAppealModal(crit.id);
+    }
   }
 
   // 4. APPEALS VIEW TABLE
@@ -1217,6 +1433,7 @@
     }
     const el = document.getElementById(`msg-${msgIndex}`);
     if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    highlightTimeline([msgIndex, last]);
     seekAudioToReplica(msgIndex);
   }
 
@@ -1332,8 +1549,9 @@
       .replace(/'/g, '&#039;');
   }
 
-  function formatTimestamp(ts) {
+  function formatTimestamp(ts, offset) {
     if (!ts) return '';
+    if (ts.includes('T') && offset !== undefined && offset !== null) return formatSec(offset);
     if (ts.includes('T')) {
       try {
         const d = new Date(ts);
@@ -1365,5 +1583,6 @@
   };
 
   document.addEventListener('DOMContentLoaded', init);
+  window.addEventListener('resize', () => applyFocus());
 
 })();
