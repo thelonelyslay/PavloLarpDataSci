@@ -2106,5 +2106,11 @@
 
   document.addEventListener('DOMContentLoaded', init);
   window.addEventListener('resize', () => applyFocus());
+  // A link with another #dialogs/<id> or tab opened in the same tab (or Back/Forward): follow it without a reload
+  window.addEventListener('hashchange', () => {
+    const h = readHash();
+    if (h.tab) switchTab(h.tab);
+    if (h.convId && h.convId !== state.activeConvId && state.conversations.some(c => c.conversation_id === h.convId)) selectConversation(h.convId);
+  });
 
 })();
