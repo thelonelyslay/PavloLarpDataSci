@@ -163,15 +163,34 @@ window.CQA_API = (function () {
         rememberEval(ev);
         return ev;
       } catch (e) {
-        if (e.data && e.data.status === 'error') { rememberEval(e.data); return e.data; }
+        // A failed model call is saved by the server as an evaluation with status "error" (it has id and conversation_id).
+        // Other errors ({status: "error", detail}) are plain request errors.
+        if (e.data && e.data.status === 'error' && e.data.id && e.data.conversation_id) { rememberEval(e.data); return e.data; }
         throw e;
       }
     },
 
-    /** POST /api/evaluations/batch {conversation_ids, checklist_id} */
-    async evaluateBatch(conversationIds, checklistId) {
+    /** Background batch: POST /api/evaluations/batch/start → {id, status, completed, total, results} */
+    async startBatch(conversationIds, checklistId) {
       if (mode !== 'live') demoOnly('Пакетная оценка');
-      return req('POST', '/evaluations/batch', { conversation_ids: conversationIds, checklist_id: checklistId }, EVAL_TIMEOUT_MS);
+      const body = { conversation_ids: conversationIds };
+      if (checklistId) body.checklist_id = checklistId;
+      return req('POST', '/evaluations/batch/start', body);
+    },
+    /** GET /api/evaluations/batch/{job_id}: progress and results so far */
+    async getBatch(jobId) {
+      return req('GET', '/evaluations/batch/' + encodeURIComponent(jobId));
+    },
+    /** POST /api/checklists/{id}/recalculate: re-evaluate every conversation of the checklist's channel (background job) */
+    async recalculateChecklist(checklistId) {
+      if (mode !== 'live') demoOnly('Пересчёт по чек-листу');
+      return req('POST', '/checklists/' + encodeURIComponent(checklistId) + '/recalculate', {});
+    },
+    /** GET /api/evaluations: up to 100 newest evaluations (to fill the list in one request) */
+    async getRecentEvaluations() {
+      if (mode !== 'live') return Object.values(clone(demo.evaluations));
+      const r = await req('GET', '/evaluations');
+      return Array.isArray(r) ? r : [];
     },
 
     async getChecklists() {
@@ -205,14 +224,18 @@ window.CQA_API = (function () {
       return req('POST', '/evaluations/' + encodeURIComponent(evaluationId) + '/appeals', { criterion_id: criterionId, comment });
     },
 
-    /** Add new conversations: POST /api/conversations {records:[...]} (needs the server route). */
+    /** Add new conversations: POST /api/conversations, one record per request (same format as the data API) */
     async addConversations(records) {
       if (mode !== 'live') demoOnly('Загрузка нового диалога');
-      try { return await req('POST', '/conversations', { records }); }
-      catch (e) {
-        if (e.status === 404 || e.status === 405) throw new Error('сервер пока не принимает новые диалоги: нужен маршрут POST /api/conversations');
-        throw e;
+      const saved = [];
+      for (const r of records) {
+        try { saved.push(await req('POST', '/conversations', r)); }
+        catch (e) {
+          if (e.status === 405) throw new Error('сервер не принимает новые диалоги (нет POST /api/conversations)');
+          throw new Error(`${r.conversation_id}: ${e.message}`);
+        }
       }
+      return saved;
     },
 
     async getAppeals(status) {

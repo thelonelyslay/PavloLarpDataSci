@@ -1500,3 +1500,4 @@ body { flex-direction: row; background: var(--page-bg); }
 .toast { padding: 11px 15px; border-radius: 10px; font-size: 13.5px; line-height: 1.4; box-shadow: 0 8px 28px rgba(0,0,0,.18); cursor: pointer; animation: modalIn .2s ease; }
 .toast-ok { background: #0d3f26; color: #fff; }
 .toast-bad { background: #b42318; color: #fff; }
+.batch-hint { font-size: 11px; color: var(--text-muted); }

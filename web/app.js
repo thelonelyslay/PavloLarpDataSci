@@ -119,7 +119,7 @@
         state.activeConvId = state.conversations[0].conversation_id;
       }
       if (state.activeConvId) await selectConversation(state.activeConvId, true);
-      if (isLive()) await preloadEvaluations();
+      if (isLive()) { await preloadEvaluations(); resumeJob(); }
 
       collectAppeals();
       renderAll();
@@ -132,20 +132,31 @@
     }
   }
 
-  // Live mode: the conversation list has no evaluation ids, so load the ones this browser created
-  // and the evaluations behind open appeals (GET /api/appeals?status=open).
+  // Live mode: fill totals, gross-error reasons and appeals. One GET /api/evaluations (newest 100),
+  // then the latest evaluation of every conversation (last_evaluation_id) and the evaluations behind open appeals.
   async function preloadEvaluations() {
-    const jobs = state.conversations.filter(c => !state.evaluations[c.conversation_id]).map(c => async () => {
-      try { const ev = await api().getLatestEvaluation(c); if (ev) storeEval(ev); } catch (e) { /* skip */ }
-    });
+    try {
+      const recent = await api().getRecentEvaluations();
+      recent.slice().reverse().forEach(ev => { if (ev && ev.id) state.evalById[ev.id] = stamp(ev); });
+    } catch (e) { /* older server: no list */ }
+    const want = new Set();
+    state.conversations.forEach(c => { if (c.last_evaluation_id && !state.evalById[c.last_evaluation_id]) want.add(c.last_evaluation_id); });
     try {
       const open = await api().getAppeals('open');
-      (Array.isArray(open) ? open : []).forEach(a => jobs.push(async () => {
-        if (state.evalById[a.evaluation_id]) return;
-        try { const ev = await api().getEvaluation(a.evaluation_id); if (ev) storeEval(ev); } catch (e) { /* skip */ }
-      }));
+      (Array.isArray(open) ? open : []).forEach(a => { if (!state.evalById[a.evaluation_id]) want.add(a.evaluation_id); });
     } catch (e) { /* appeals list unavailable */ }
-    for (let i = 0; i < jobs.length; i += 6) await Promise.all(jobs.slice(i, i + 6).map(f => f()));
+    const ids = [...want];
+    for (let i = 0; i < ids.length; i += 6) {
+      await Promise.all(ids.slice(i, i + 6).map(async id => {
+        try { const ev = await api().getEvaluation(id); if (ev) state.evalById[ev.id] = ev; } catch (e) { /* skip */ }
+      }));
+    }
+    // the conversation's latest evaluation is the one the server names; otherwise the newest we know
+    state.conversations.forEach(c => {
+      const ev = (c.last_evaluation_id && state.evalById[c.last_evaluation_id])
+        || Object.values(state.evalById).filter(e => e.conversation_id === c.conversation_id).sort((x, y) => (y._seq || 0) - (x._seq || 0))[0];
+      if (ev) { state.evaluations[c.conversation_id] = ev; syncConvFromEval(c, ev); }
+    });
   }
 
   async function ensureEvaluationLoaded(cid, force) {
@@ -404,27 +415,68 @@
     }
   }
 
-  // "Оценить все": one request per conversation so the progress is visible; the server caches unchanged results
+  // "Оценить все": background job on the server (POST /api/evaluations/batch/start), progress by polling
+  const JOB_KEY = 'cqa_batch_job';
   async function evaluateAll(ids, label) {
     if (!isLive()) { toast('Пакетная оценка работает только с сервером.'); return; }
-    if (state.batch) return;
+    if (state.batch) { toast('Пакетная оценка уже идёт'); return; }
     if (!ids.length) { toast('Нет диалогов для оценки'); return; }
-    state.batch = { total: ids.length, done: 0, errors: 0, stop: false, label: label || 'Оценка' };
+    // one checklist for the whole job only if every conversation is of the picked checklist's channel
+    const convs = ids.map(id => state.conversations.find(c => c.conversation_id === id)).filter(Boolean);
+    const clIds = [...new Set(convs.map(c => checklistIdFor(c)))];
+    const checklistId = clIds.length === 1 ? clIds[0] : null;
+    try {
+      const job = await api().startBatch(ids, checklistId);
+      await followJob(job, label || 'Оценка');
+    } catch (e) {
+      toast('Не удалось запустить пакетную оценку: ' + e.message);
+    }
+  }
+
+  async function followJob(job, label) {
+    state.batch = { id: job.id, total: job.total || 0, done: job.completed || 0, errors: 0, label, seen: 0 };
+    try { localStorage.setItem(JOB_KEY, JSON.stringify({ id: job.id, label })); } catch (e) { /* storage off */ }
     renderBatchBar();
-    for (const cid of ids) {
-      if (state.batch.stop) break;
-      const ev = await evaluateOne(cid);
-      if (!ev || ev.status === 'error') state.batch.errors++;
-      state.batch.done++;
+    let cur = job;
+    while (true) {
+      const fresh = (cur.results || []).slice(state.batch.seen);
+      state.batch.seen += fresh.length;
+      for (const r of fresh) {
+        if (r.evaluation && r.evaluation.id) { storeEval(stamp(r.evaluation)); if (r.evaluation.status === 'error') state.batch.errors++; }
+        else { state.batch.errors++; if (r.conversation_id === state.activeConvId) state.evalError = { cid: r.conversation_id, message: r.error || 'ошибка оценки' }; }
+        const conv = state.conversations.find(c => c.conversation_id === r.conversation_id);
+        if (conv && !r.evaluation) conv.evaluation_status = 'error';
+      }
+      state.batch.done = cur.completed || state.batch.seen;
+      state.batch.total = cur.total || state.batch.total;
       renderBatchBar();
-      renderConversationsList();
-      if (cid === state.activeConvId) { renderTranscript(); renderEvaluationCard(); }
+      if (fresh.length) {
+        renderConversationsList();
+        if (fresh.some(r => r.conversation_id === state.activeConvId)) { renderTranscript(); renderEvaluationCard(); }
+      }
+      if (cur.status === 'done') break;
+      await new Promise(r => setTimeout(r, 1500));
+      try { cur = await api().getBatch(state.batch.id); }
+      catch (e) {
+        if (e.status === 404) { toast('Пакетная задача не найдена на сервере (сервер перезапускали?)'); break; }
+        await new Promise(r => setTimeout(r, 3000)); // network hiccup: keep polling
+      }
     }
     const b = state.batch;
     state.batch = null;
+    try { localStorage.removeItem(JOB_KEY); } catch (e) { /* storage off */ }
     collectAppeals();
     renderAll();
-    toast(`${b.label}: ${b.done - b.errors} из ${b.total} готово${b.errors ? `, ошибок: ${b.errors}` : ''}${b.stop ? ' (остановлено)' : ''}`);
+    toast(`${b.label}: готово ${b.done - b.errors} из ${b.total}${b.errors ? `, ошибок: ${b.errors}` : ''}`, b.errors ? 'error' : 'ok');
+  }
+
+  // After a page reload: continue showing a job that is still running on the server
+  async function resumeJob() {
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(JOB_KEY) || 'null'); } catch (e) { /* storage off */ }
+    if (!saved || !saved.id || state.batch) return;
+    try { const job = await api().getBatch(saved.id); followJob(job, saved.label || 'Оценка'); }
+    catch (e) { try { localStorage.removeItem(JOB_KEY); } catch (x) { /* storage off */ } }
   }
 
   function renderBatchBar() {
@@ -437,13 +489,11 @@
       if (btn) btn.onclick = () => evaluateAll(visibleConversations().map(c => c.conversation_id), 'Оценка');
       return;
     }
-    box.innerHTML = `<div class="batch-progress">
+    box.innerHTML = `<div class="batch-progress" id="batch-progress">
         <div class="batch-text"><b>${escapeHtml(b.label)}: ${b.done} / ${b.total}</b>${b.errors ? ` · ошибок ${b.errors}` : ''}</div>
         <div class="bar-track"><div class="bar-fill" style="width:${b.total ? b.done / b.total * 100 : 0}%"></div></div>
-        <button class="chip-btn" id="btn-batch-stop">Остановить</button>
+        <div class="batch-hint">Идёт на сервере; можно открывать диалоги и перезагружать страницу.</div>
       </div>`;
-    const stop = document.getElementById('btn-batch-stop');
-    if (stop) stop.onclick = () => { b.stop = true; stop.disabled = true; stop.textContent = 'Останавливаем…'; };
   }
 
   function renderTranscriptActions() {
@@ -1500,9 +1550,15 @@
     const channel = cl.applies_to || 'agent chat';
     const ids = state.conversations.filter(c => c.channel === channel).map(c => c.conversation_id);
     if (!ids.length) { toast('Нет диалогов канала ' + channel); return; }
-    if (!confirm(`Пересчитать ${ids.length} диалог(ов) по чек-листу «${cl.name}» v${cl.version}? Для каждого диалога сервер вызовет модель.`)) return;
+    if (!confirm(`Пересчитать ${ids.length} диалог(ов) канала «${channel}» по чек-листу «${cl.name}» v${cl.version}? Для каждого диалога сервер вызовет модель.`)) return;
+    if (state.batch) { toast('Пакетная оценка уже идёт'); return; }
     switchTab('tab-workspace');
-    await evaluateAll(ids, `Пересчёт по v${cl.version}`);
+    try {
+      const job = await api().recalculateChecklist(cl.id);
+      await followJob(job, `Пересчёт по v${cl.version}`);
+    } catch (e) {
+      toast('Не удалось запустить пересчёт: ' + e.message);
+    }
   }
 
   function renderChecklistActions() {
@@ -1538,6 +1594,7 @@
         if (!['client', 'operator', 'bot', 'system'].includes(m.speaker)) throw new Error(`${where}, реплика #${k}: speaker «${m.speaker}» не из client/operator/bot/system`);
       });
       r.language = String(r.language || '').toUpperCase();
+      if (!['RU', 'KZ', 'EN'].includes(r.language)) throw new Error(`${where}: language должен быть RU, KZ или EN`);
     });
     return recs;
   }
