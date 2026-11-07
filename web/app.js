@@ -72,7 +72,7 @@
     }
     return { cls: 'ans-na', text: '—' };
   }
-  function fmt2(n) { return n === null || n === undefined || isNaN(n) ? '—' : Number(n).toFixed(2); }
+  function fmt2(n) { return n === null || n === undefined || isNaN(n) ? '—' : Number(n).toLocaleString('ru-RU', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
   // Floating notice: red for problems, green for done
   function toast(msg, kind) {
     const bad = kind === 'error' || (kind === undefined && /не удалось|ошибк|не сохранен|не отправлен|^укажите|^выберите|^проверьте|только с сервером|недоступ|нет диалогов|сначала|изменений нет|не принимает/i.test(msg));
@@ -1213,7 +1213,7 @@
     const grossEl = document.getElementById('kpi-gross-errors');
     const appealsEl = document.getElementById('kpi-appeals-count');
 
-    if (avgEl) avgEl.textContent = validScores.length ? avgScore.toFixed(2) : '—';
+    if (avgEl) avgEl.textContent = validScores.length ? fmtShort(avgScore) : '—';
     if (totalEl) totalEl.textContent = totalConvs;
     if (grossEl) grossEl.textContent = grossErrors;
     if (appealsEl) appealsEl.textContent = appealsCount;
@@ -1247,7 +1247,7 @@
           <span class="distrib-bar-val">${fair} (${Math.round((fair / totalConvs) * 100)}%)</span>
         </div>
         <div class="distrib-bar-row">
-          <span class="distrib-bar-label">Грубые ошибки (Комплаенс):</span>
+          <span class="distrib-bar-label">Грубые ошибки:</span>
           <div class="distrib-bar-track"><div class="distrib-bar-fill" style="width: ${(grossErrors / totalConvs) * 100}%; background: var(--danger);"></div></div>
           <span class="distrib-bar-val" style="color: var(--danger);">${grossErrors} (${Math.round((grossErrors / totalConvs) * 100)}%)</span>
         </div>
