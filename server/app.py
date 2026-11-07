@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import sqlite3
 from uuid import uuid4
 from html import escape
@@ -13,6 +14,7 @@ from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
+import certifi
 
 from src.cqa.scoring import validate_checklist
 
@@ -136,7 +138,8 @@ def import_conversations() -> int:
         payload = json.loads(DEV_PATH.read_text(encoding="utf-8"))
     elif url:
         request = Request(url, headers={"Accept": "application/json", "User-Agent": "CQA-server/1.0"})
-        with urlopen(request, timeout=20) as response:
+        context = ssl.create_default_context(cafile=certifi.where())
+        with urlopen(request, timeout=20, context=context) as response:
             payload = json.load(response)
     else:
         return 0
