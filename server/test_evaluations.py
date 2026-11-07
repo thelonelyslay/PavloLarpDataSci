@@ -135,6 +135,20 @@ class WeightOnlyChangeTest(unittest.TestCase):
             evaluations.create_evaluation({"conversation_id": "w-1", "checklist_id": rule_id})
             self.assertEqual(model.call_count, 2)  # changed rule -> normal evaluation
 
+    def test_reuses_one_model_chain_from_export(self):
+        # export_results.py --require-model stores keys with EVAL_MODELS = that one model
+        import os
+        with patch.object(evaluations, "_run_engine", side_effect=self.fake_engine) as model:
+            with patch.dict(os.environ, {"EVAL_MODELS": "test-model"}):
+                evaluations.create_evaluation({"conversation_id": "w-3"})
+            with patch.dict(os.environ, {"EVAL_MODELS": "test-model,backup-model"}):
+                def weights(ck):
+                    ck["criteria"][0]["weight"] = 25
+                rescored = evaluations.create_evaluation({"conversation_id": "w-3",
+                                                          "checklist_id": self._new_version(weights)})
+            self.assertEqual(model.call_count, 1)
+            self.assertEqual(rescored["cost_usd"], 0.0)
+
     def test_changed_transcript_is_evaluated_again(self):
         with patch.object(evaluations, "_run_engine", side_effect=self.fake_engine) as model:
             evaluations.create_evaluation({"conversation_id": "w-2"})

@@ -90,11 +90,16 @@ def _load_evaluation(evaluation_id: str) -> tuple[dict, dict]:
     return dict(row), json.loads(row["result_json"])
 
 
-def _cache_key(record: dict, checklist: dict, checklist_id: str) -> str:
-    """Cache key of one evaluation (the formula src/cqa/export_results.py repeats; keep them equal)."""
+def _cache_key(record: dict, checklist: dict, checklist_id: str, models: Optional[str] = None) -> str:
+    """Cache key of one evaluation (the formula src/cqa/export_results.py repeats; keep them equal).
+
+    models: the model chain; default EVAL_MODELS. export_results.py --require-model stores keys
+    with a one-model chain (the model itself).
+    """
+    chain = os.environ.get("EVAL_MODELS", "") if models is None else models
     source = json.dumps({"conversation_id": record["id"], "transcript": record["transcript"], "language": record["language"],
                          "channel": record["channel"], "checklist": checklist, "checklist_id": checklist_id,
-                         "models": os.environ.get("EVAL_MODELS", "")}, sort_keys=True, ensure_ascii=False)
+                         "models": chain}, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(source.encode("utf-8")).hexdigest()
 
 
@@ -116,7 +121,8 @@ def _reusable_evaluation(record: dict, checklist: dict, checklist_id: str):
     """A successful evaluation of this dialog by ANOTHER checklist version that differs only in weights.
 
     Conditions: same prompt fingerprint, and its stored cache key still matches when recomputed with its own
-    checklist, i.e. the transcript and the model chain (EVAL_MODELS) did not change since then.
+    checklist, i.e. the transcript did not change since then, and it was made with the current model chain
+    (EVAL_MODELS) or with a one-model chain of the model that answered (export_results.py --require-model).
     The same checklist version is never reused here (after an appeal it is deliberately evaluated again).
     """
     fingerprint = _prompt_fingerprint(checklist)
@@ -130,7 +136,9 @@ def _reusable_evaluation(record: dict, checklist: dict, checklist_id: str):
         old_checklist = json.loads(row["old_checklist_json"])
         if _prompt_fingerprint(old_checklist) != fingerprint:
             continue
-        if _cache_key(record, old_checklist, row["checklist_id"]) != row["cache_key"]:
+        expected = {_cache_key(record, old_checklist, row["checklist_id"]),
+                    _cache_key(record, old_checklist, row["checklist_id"], models=row["model"])}
+        if row["cache_key"] not in expected:
             continue  # the transcript or the model chain changed: the old answers may not hold
         return row
     return None
