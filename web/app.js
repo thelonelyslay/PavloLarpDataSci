@@ -89,6 +89,7 @@
   // --- INITIALIZATION ---
   async function init() {
     bindEvents();
+    restoreUiState();
     await loadData();
   }
 
@@ -119,7 +120,7 @@
         state.activeConvId = state.conversations[0].conversation_id;
       }
       if (state.activeConvId) await selectConversation(state.activeConvId, true);
-      if (isLive()) { await preloadEvaluations(); resumeJob(); }
+      if (isLive()) { await preloadEvaluations(); resumeJob(); loadTranscriptsInBackground(); }
 
       collectAppeals();
       renderAll();
@@ -141,10 +142,12 @@
     } catch (e) { /* older server: no list */ }
     const want = new Set();
     state.conversations.forEach(c => { if (c.last_evaluation_id && !state.evalById[c.last_evaluation_id]) want.add(c.last_evaluation_id); });
-    try {
-      const open = await api().getAppeals('open');
-      (Array.isArray(open) ? open : []).forEach(a => { if (!state.evalById[a.evaluation_id]) want.add(a.evaluation_id); });
-    } catch (e) { /* appeals list unavailable */ }
+    for (const st of ['open', 'decided']) {
+      try {
+        const list = await api().getAppeals(st);
+        (Array.isArray(list) ? list : []).forEach(a => { if (!state.evalById[a.evaluation_id]) want.add(a.evaluation_id); });
+      } catch (e) { /* appeals list unavailable */ }
+    }
     const ids = [...want];
     for (let i = 0; i < ids.length; i += 6) {
       await Promise.all(ids.slice(i, i + 6).map(async id => {
@@ -157,6 +160,17 @@
         || Object.values(state.evalById).filter(e => e.conversation_id === c.conversation_id).sort((x, y) => (y._seq || 0) - (x._seq || 0))[0];
       if (ev) { state.evaluations[c.conversation_id] = ev; syncConvFromEval(c, ev); }
     });
+  }
+
+  // The server list has no texts: fetch transcripts quietly for previews and text search
+  async function loadTranscriptsInBackground() {
+    const todo = state.conversations.filter(c => !c.transcript);
+    for (let i = 0; i < todo.length; i += 6) {
+      await Promise.all(todo.slice(i, i + 6).map(async c => {
+        try { const full = await api().getConversation(c.conversation_id); c.transcript = full.transcript; c.audio_url = full.audio_url; } catch (e) { /* skip */ }
+      }));
+      renderConversationsList();
+    }
   }
 
   async function ensureEvaluationLoaded(cid, force) {
@@ -366,6 +380,7 @@
   async function selectConversation(cid, quiet) {
     if (state.activeConvId !== cid) state.selCrit = null;
     state.activeConvId = cid;
+    writeHash();
     if (!quiet) renderConversationsList();
 
     let conv = state.conversations.find(c => c.conversation_id === cid);
@@ -480,6 +495,13 @@
   }
 
   function renderBatchBar() {
+    const g = document.getElementById('global-progress');
+    if (g) {
+      const b = state.batch;
+      g.style.display = b ? 'block' : 'none';
+      if (b) g.innerHTML = `<div class="gp-text">⏳ ${escapeHtml(b.label)}: ${b.done} / ${b.total}${b.errors ? ` · ошибок ${b.errors}` : ''}</div>
+        <div class="gp-track"><div class="gp-fill" style="width:${b.total ? b.done / b.total * 100 : 0}%"></div></div>`;
+    }
     const box = document.getElementById('batch-bar');
     if (!box) return;
     const b = state.batch;
@@ -500,7 +522,7 @@
     const box = document.getElementById('transcript-actions');
     if (!box) return;
     const ev = state.evaluations[state.activeConvId];
-    const busy = state.evaluating === state.activeConvId || Boolean(state.batch);
+    const busy = state.evaluating === state.activeConvId;
     const live = isLive();
     box.innerHTML = `
       <button class="btn-primary" id="btn-evaluate" ${busy || !live ? 'disabled' : ''}
@@ -936,7 +958,10 @@
     if (!crit) return null;
     const idx = (crit.evidence || []).map(e => Number(e.message_index)).filter(n => !isNaN(n));
     if (idx.length) return [Math.min(...idx), Math.max(...idx)];
-    if (Array.isArray(crit.checked_range) && crit.checked_range.length === 2) return [Number(crit.checked_range[0]), Number(crit.checked_range[1])];
+    // the checked range only matters when the action was missing (no/partial/flag), not for passed or N/A criteria
+    const ev = state.evaluations[state.activeConvId];
+    const stt = ev ? critStatus(critDef(ev, crit.id), crit) : 'bad';
+    if (['bad', 'part', 'flag'].includes(stt) && Array.isArray(crit.checked_range) && crit.checked_range.length === 2) return [Number(crit.checked_range[0]), Number(crit.checked_range[1])];
     return null;
   }
   function selectedCrit() {
@@ -962,8 +987,9 @@
     const crits = ev.criteria || [];
     // default selection: the first criterion that lost points (or a gross error flag)
     if (!crits.find(c => c.id === state.selCrit)) {
-      const lost = crits.find(c => ['flag', 'bad', 'part'].includes(critStatus(critDef(ev, c.id), c)));
-      state.selCrit = (lost || crits[0] || {}).id || null;
+      const st = c => critStatus(critDef(ev, c.id), c);
+      const pick = crits.find(c => st(c) === 'flag') || crits.find(c => ['bad', 'part'].includes(st(c)));
+      state.selCrit = pick ? pick.id : null; // nothing lost: no criterion is preselected
     }
     const ICON = { ok: '✓', part: '≈', bad: '✕', na: 'N/A', flag: '!' };
     if (list) {
@@ -1012,8 +1038,8 @@
     const go = document.getElementById('btn-goto-fragment');
     const dis = document.getElementById('btn-dispute');
     if (!ev || !crit) {
-      if (whyT) whyT.textContent = 'Почему снижена оценка';
-      if (whyX) whyX.textContent = ev ? '—' : 'Диалог ещё не оценён.';
+      if (whyT) whyT.textContent = ev ? 'Оценка не снижена' : 'Почему снижена оценка';
+      if (whyX) whyX.textContent = ev ? 'Все применимые критерии выполнены. Нажмите на критерий, чтобы увидеть обоснование и реплики.' : 'Диалог ещё не оценён.';
       if (go) go.disabled = true;
       if (dis) dis.disabled = true;
       return;
@@ -1053,20 +1079,25 @@
 
     tbody.innerHTML = '';
     if (state.appeals.length === 0) {
-      tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">Нет активных апелляций</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: 30px;">Апелляций пока нет. Оспорить оценку можно в карточке диалога: кнопка «Оспорить оценку».</td></tr>';
       return;
     }
 
     state.appeals.forEach(item => {
       const tr = document.createElement('tr');
       const isPending = item.appeal.status === 'open';
+      const ev = state.evalById[item.evaluation_id] || {};
+      const crit = (ev.criteria || []).find(c => c.id === item.criterion_id) || {};
+      const def = critDef(ev, item.criterion_id);
+      const orig = crit.original_answer !== undefined && crit.original_answer !== null ? crit.original_answer : crit.answer;
+      const accepted = item.appeal.decision === 'change';
       tr.innerHTML = `
         <td><a href="javascript:void(0)" onclick="app.selectConversationAndTab('${escapeHtml(item.conversation_id)}')" style="font-weight: 700; color: var(--primary); text-decoration: none;">${escapeHtml(item.conversation_id)}</a></td>
         <td><strong>${escapeHtml(item.criterion_title)}</strong></td>
         <td><span class="ans-badge ${item.view.cls}">${item.view.text}</span></td>
         <td style="max-width: 320px;">${escapeHtml(item.appeal.comment)}</td>
         <td>
-          <span class="badge ${isPending ? 'score-fair' : 'score-perfect'}">${isPending ? 'На рассмотрении' : 'Завершено'}</span>
+          <span class="badge ${isPending ? 'score-fair' : 'score-perfect'}">${isPending ? 'На рассмотрении' : 'Решено'}</span>
         </td>
         <td>
           ${isPending ? `
@@ -1074,7 +1105,10 @@
               Принять решение
             </button>
           ` : `
-            <span style="font-size: 11px; color: var(--text-muted);">Решение принято</span>
+            <div class="ap-decision ${accepted ? 'acc' : 'rej'}">${accepted ? 'Принята' : 'Отклонена'}${accepted ? `: ${answerView(def, crit, orig).text} → ${answerView(def, crit).text}` : ''}</div>
+            ${accepted && ev.original_total !== ev.total ? `<div class="ap-total">Итог ${fmtShort(ev.original_total)} → <b>${fmtShort(ev.total)}</b></div>` : ''}
+            <div class="ap-reason">${escapeHtml(item.appeal.reason || '')}</div>
+            <button class="chip-btn" onclick="app.openReviewModal('${escapeHtml(item.evaluation_id)}', '${escapeHtml(item.criterion_id)}')">Открыть</button>
           `}
         </td>
       `;
@@ -1110,13 +1144,28 @@
         indicatorEl.innerHTML = '✓ Сумма весов: <strong>100 / 100</strong> (Сбалансировано)';
       } else {
         indicatorEl.className = 'weight-indicator-badge weight-indicator-warn';
-        indicatorEl.innerHTML = `⚠️ Внимание: Сумма базовых весов равна <strong>${sumWeights} / 100</strong>! (Рекомендуется 100)`;
+        indicatorEl.innerHTML = `Сумма весов: <strong>${sumWeights}</strong> — итог всё равно приводится к 100 (вес × 100 / сумма применимых)`;
       }
     }
 
     tbody.innerHTML = '';
+    // Draft: mark new / changed criteria against the version it is based on
+    const base = state.activeChecklistKey === 'draft' ? state.checklists[checklist.based_on] : null;
+    const FIELDS = { title: 'название', section: 'секция', type: 'тип', weight: 'вес', allow_na: 'N/A', na_condition: 'условие N/A', steps: 'шкала', instruction: 'инструкция', rules: 'правила' };
+    const diffOf = crit => {
+      if (!base) return null;
+      const old = (base.criteria || []).find(c => c.id === crit.id);
+      if (!old) return { isNew: true };
+      const changed = Object.keys(FIELDS).filter(k => JSON.stringify(old[k] ?? null) !== JSON.stringify(crit[k] ?? null));
+      return changed.length ? { changed, old } : null;
+    };
     checklist.criteria.forEach((crit, idx) => {
       const tr = document.createElement('tr');
+      const diff = diffOf(crit);
+      if (diff) tr.className = diff.isNew ? 'row-new' : 'row-changed';
+      const diffBadge = !diff ? '' : diff.isNew ? '<span class="diff-badge new">новый</span>'
+        : `<span class="diff-badge chg" title="${escapeHtml(diff.changed.map(k => FIELDS[k]).join(', '))}">изменён: ${escapeHtml(diff.changed.map(k => FIELDS[k]).join(', '))}</span>`;
+      const weightCell = diff && !diff.isNew && diff.changed.includes('weight') ? `<span class="old-val">${diff.old.weight}</span> → <strong>${crit.weight}</strong>` : `<strong>${crit.weight}</strong>`;
       let typeLabel = 'Да / Нет';
       if (crit.type === 'scale') typeLabel = `Шкала [${(crit.steps || []).join(', ')}]`;
       else if (crit.type === 'flag') typeLabel = 'Флаг (Грубая ошибка)';
@@ -1124,9 +1173,9 @@
       tr.innerHTML = `
         <td>${idx + 1}</td>
         <td><span class="badge badge-chat">${escapeHtml(crit.section || '—')}</span></td>
-        <td><strong>${escapeHtml(crit.title)}</strong>${crit.instruction ? `<div style="font-size:11px;color:var(--text-muted);margin-top:3px">${escapeHtml(crit.instruction)}</div>` : ''}</td>
+        <td><strong>${escapeHtml(crit.title)}</strong> ${diffBadge}${crit.instruction ? `<div style="font-size:11px;color:var(--text-muted);margin-top:3px">${escapeHtml(crit.instruction)}</div>` : ''}</td>
         <td>${typeLabel}${crit.allow_na && crit.na_condition ? `<div style="font-size:11px;color:var(--text-muted);margin-top:3px">${escapeHtml(crit.na_condition)}</div>` : ''}</td>
-        <td><strong>${crit.weight}</strong></td>
+        <td>${crit.type === 'flag' ? '—' : weightCell}</td>
         <td>${crit.allow_na ? '<span style="color: var(--success); font-weight: 700;">✓ Да</span>' : '<span style="color: var(--text-muted);">— Нет</span>'}</td>
         <td style="max-width: 280px; font-size: 12px; color: #334155;">
           ${crit.rules ? `<div class="rules-box" style="margin: 0;">${escapeHtml(crit.rules)}</div>` : '<span style="color: var(--text-muted);">—</span>'}
@@ -1140,6 +1189,15 @@
       `;
       tbody.appendChild(tr);
     });
+    if (base) {
+      const removed = (base.criteria || []).filter(c => !checklist.criteria.find(x => x.id === c.id));
+      if (removed.length) {
+        const tr = document.createElement('tr');
+        tr.className = 'row-removed';
+        tr.innerHTML = `<td colspan="8">Удалены из черновика: ${removed.map(c => `<s>${escapeHtml(c.title)}</s>`).join(', ')}</td>`;
+        tbody.appendChild(tr);
+      }
+    }
   }
 
   // 6. EXECUTIVE ANALYTICS DASHBOARD
@@ -1353,7 +1411,11 @@
       sel.innerHTML = opts.filter(([v]) => v !== cur).map(([v, l]) => `<option value="${escapeHtml(v)}">${escapeHtml(l)}</option>`).join('');
     }
     const decided = crit.appeal.status !== 'open';
-    ['btn-review-accept', 'btn-review-reject'].forEach(id => { const b = document.getElementById(id); if (b) b.disabled = decided || !isLive(); });
+    ['btn-review-accept', 'btn-review-reject'].forEach(id => { const b = document.getElementById(id); if (b) { b.disabled = decided || !isLive(); b.style.display = decided ? 'none' : ''; } });
+    const grp = document.getElementById('review-new-answer-group'); if (grp) grp.style.display = decided ? 'none' : '';
+    const rs = document.getElementById('review-modal-reason');
+    if (rs) { rs.value = decided ? (crit.appeal.reason || '') : ''; rs.readOnly = decided; }
+    setText('review-modal-status', decided ? (crit.appeal.decision === 'change' ? 'Апелляция принята, оценка изменена.' : 'Апелляция отклонена, оценка оставлена.') : '');
     const modal = document.getElementById('review-modal');
     if (modal) modal.classList.add('active');
   }
@@ -1565,9 +1627,9 @@
     if (!ids.length) { toast('Нет диалогов канала ' + channel); return; }
     if (!confirm(`Пересчитать ${ids.length} диалог(ов) канала «${channel}» по чек-листу «${cl.name}» v${cl.version}? Для каждого диалога сервер вызовет модель.`)) return;
     if (state.batch) { toast('Пакетная оценка уже идёт'); return; }
-    switchTab('tab-workspace');
     try {
       const job = await api().recalculateChecklist(cl.id);
+      toast(`Пересчёт запущен на сервере: ${job.total || ids.length} диалог(ов). Прогресс — в меню слева; можно работать дальше.`, 'ok');
       await followJob(job, `Пересчёт по v${cl.version}`);
     } catch (e) {
       toast('Не удалось запустить пересчёт: ' + e.message);
@@ -1590,7 +1652,12 @@
 
   // --- NEW CONVERSATION FROM JSON (POST /api/conversations) ---
   function parseRecords(text) {
-    const data = JSON.parse(text);
+    let data;
+    try { data = JSON.parse(text); }
+    catch (e) {
+      const m = String(e.message).match(/line (\d+) column (\d+)/);
+      throw new Error('это не JSON: проверьте скобки, кавычки и запятые' + (m ? ` (строка ${m[1]}, символ ${m[2]})` : ''));
+    }
     let recs;
     if (Array.isArray(data)) recs = data;
     else if (data && data.data && Array.isArray(data.data.records)) recs = data.data.records;
@@ -1625,7 +1692,9 @@
     try {
       const recs = parseRecords(txt);
       box.className = 'upload-check ok';
-      box.textContent = `✓ ${recs.length} диалог(ов): ` + recs.map(r => `${r.conversation_id} (${r.channel}, ${r.language || '—'}, ${r.transcript.length} реплик)`).join('; ');
+      const dup = recs.filter(r => state.conversations.some(c => c.conversation_id === String(r.conversation_id)));
+      box.textContent = `✓ ${recs.length} диалог(ов): ` + recs.map(r => `${r.conversation_id} (${r.channel}, ${r.language || '—'}, ${r.transcript.length} реплик)`).join('; ')
+        + (dup.length ? ` — внимание: ${dup.map(r => r.conversation_id).join(', ')} уже есть, диалог будет заменён` : '');
       return recs;
     } catch (e) {
       box.className = 'upload-check bad';
@@ -1643,6 +1712,7 @@
       await api().addConversations(recs);
       closeModal('upload-modal');
       state.conversations = await api().getConversations();
+      loadTranscriptsInBackground();
       const ids = recs.map(r => String(r.conversation_id));
       state.activeConvId = ids[0];
       await selectConversation(ids[0]);
@@ -1788,6 +1858,38 @@
     if (link && conv.audio_url) link.href = conv.audio_url.split('#')[0] + '#t=' + Math.floor(Math.max(0, cur - first));
   }
 
+  // --- UI STATE THAT SURVIVES A RELOAD (data itself always comes from the server) ---
+  const TAB_HASH = { 'tab-workspace': 'dialogs', 'tab-checklist': 'checklists', 'tab-appeals': 'appeals', 'tab-analytics': 'analytics' };
+  function writeHash() {
+    const tab = (document.querySelector('.nav-tab-btn.active') || {}).dataset;
+    const name = TAB_HASH[(tab && tab.tab) || 'tab-workspace'] || 'dialogs';
+    const h = '#' + name + (name === 'dialogs' && state.activeConvId ? '/' + encodeURIComponent(state.activeConvId) : '');
+    if (location.hash !== h) history.replaceState(null, '', h);
+  }
+  function readHash() {
+    const [name, id] = location.hash.replace(/^#/, '').split('/');
+    const tab = Object.keys(TAB_HASH).find(k => TAB_HASH[k] === name);
+    return { tab: tab || null, convId: id ? decodeURIComponent(id) : null };
+  }
+  function saveUiState() {
+    try { sessionStorage.setItem('cqa_ui', JSON.stringify({ filters: state.filters, checklist: state.activeChecklistKey })); } catch (e) { /* storage off */ }
+  }
+  function restoreUiState() {
+    try {
+      const ui = JSON.parse(sessionStorage.getItem('cqa_ui') || 'null');
+      if (ui && ui.filters) Object.assign(state.filters, ui.filters);
+      if (ui && ui.checklist) state.activeChecklistKey = ui.checklist;
+    } catch (e) { /* storage off */ }
+    const f = state.filters;
+    const chip = f.status !== 'all' ? f.status : (f.channel !== 'all' ? f.channel : 'all');
+    document.querySelectorAll('.filter-chips button[data-filter]').forEach(b => b.classList.toggle('active', b.dataset.filter === chip));
+    document.querySelectorAll('.filter-chips button[data-lang]').forEach(b => b.classList.toggle('active', b.dataset.lang === f.lang));
+    const si = document.getElementById('conv-search-input'); if (si) si.value = f.search || '';
+    const h = readHash();
+    if (h.convId) state.activeConvId = h.convId;
+    if (h.tab) switchTab(h.tab);
+  }
+
   function switchTab(tabId) {
     document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.nav-tab-btn').forEach(b => b.classList.remove('active'));
@@ -1797,6 +1899,7 @@
 
     const btn = document.querySelector(`[data-tab="${tabId}"]`);
     if (btn) btn.classList.add('active');
+    writeHash();
   }
 
   // --- BIND EVENTS ---
@@ -1809,6 +1912,7 @@
     if (chkPicker) {
       chkPicker.onchange = () => {
         state.activeChecklistKey = chkPicker.value;
+        saveUiState();
         renderAll();
       };
     }
@@ -1825,6 +1929,7 @@
     if (searchInput) {
       searchInput.oninput = (e) => {
         state.filters.search = e.target.value;
+        saveUiState();
         renderConversationsList();
       };
     }
@@ -1835,6 +1940,7 @@
         btn.classList.add('active');
         state.filters.channel = btn.dataset.filter === 'chat' || btn.dataset.filter === 'voice' ? btn.dataset.filter : 'all';
         state.filters.status = btn.dataset.filter === 'error' || btn.dataset.filter === 'appeal' ? btn.dataset.filter : 'all';
+        saveUiState();
         renderConversationsList();
       };
     });
@@ -1844,6 +1950,7 @@
         document.querySelectorAll('.filter-chips button[data-lang]').forEach(b => b.classList.remove('active'));
         btn.classList.add('active');
         state.filters.lang = btn.dataset.lang;
+        saveUiState();
         renderConversationsList();
       };
     });

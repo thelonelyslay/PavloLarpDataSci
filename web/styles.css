@@ -1504,3 +1504,29 @@ body { flex-direction: row; background: var(--page-bg); }
 .why-sub { font-size: 13px; color: #555; margin-top: 4px; }
 .expl-label { font-weight: 700; color: var(--text-muted); }
 #btn-export-server:disabled { opacity: .5; cursor: not-allowed; }
+
+/* --- QA fixes --- */
+.global-progress { background: rgba(255,255,255,.08); border-radius: 8px; padding: 8px 10px; font-size: 12px; color: #fff; }
+.gp-text { margin-bottom: 6px; line-height: 1.3; }
+.gp-track { height: 5px; background: rgba(255,255,255,.18); border-radius: 3px; overflow: hidden; }
+.gp-fill { height: 100%; background: #6fd08c; transition: width .4s; }
+.cs-name { white-space: normal; line-height: 1.25; overflow: visible; }
+.ap-decision { font-size: 12px; font-weight: 700; }
+.ap-decision.acc { color: #1d6b3c; } .ap-decision.rej { color: #8a5a00; }
+.ap-total { font-size: 12px; color: #333; margin-top: 2px; }
+.ap-reason { font-size: 12px; color: var(--text-muted); margin: 3px 0 6px; max-width: 260px; }
+.review-status { font-weight: 700; color: #1d6b3c; margin-bottom: 8px; }
+.review-status:empty { display: none; }
+.checklist-builder-actions { display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; align-items: center; }
+.checklist-builder-actions button { white-space: nowrap; padding: 9px 14px; }
+.view-header { gap: 20px; }
+.diff-badge { display: inline-block; font-size: 10.5px; font-weight: 700; border-radius: 4px; padding: 1px 6px; margin-left: 4px; vertical-align: middle; }
+.diff-badge.new { background: #dcfce7; color: #166534; }
+.diff-badge.chg { background: #fef3c7; color: #92400e; }
+tr.row-new td { background: #f0fdf4; }
+tr.row-changed td { background: #fffbeb; }
+tr.row-removed td { background: #fef2f2; color: #991b1b; font-size: 12.5px; }
+.old-val { text-decoration: line-through; color: var(--text-muted); }
+#criterion-modal textarea { font-family: inherit; font-size: 13.5px; }
+.cs-name { overflow-wrap: anywhere; hyphens: auto; }
+.cs-pts { flex: none; margin-left: 6px; }

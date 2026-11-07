@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Freedom Broker CQA · Оценка качества диалогов</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230d3f26'/%3E%3Cpath d='M9 8h14v4h-9.5v3H21v4h-7.5v6H9z' fill='%23fff'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -27,6 +28,7 @@
         <svg viewBox="0 0 24 24"><path d="M6 20V12M12 20V6M18 20v-9"/></svg><span>Аналитика</span>
       </button>
     </nav>
+    <div class="global-progress" id="global-progress" style="display: none;"></div>
     <div class="side-bottom">
       <label class="side-label">Активный чек-лист</label>
       <select id="checklist-picker" class="checklist-selector" title="Активный чек-лист (загружается с сервера)"></select>
@@ -64,7 +66,7 @@
           <div class="sidebar-header">
             <div class="search-box">
               <span class="search-icon">🔍</span>
-              <input type="text" id="conv-search-input" class="search-input" placeholder="Поиск по ID или тексту...">
+              <input type="text" id="conv-search-input" autocomplete="off" class="search-input" placeholder="Поиск по ID или тексту...">
             </div>
 
             <div class="filter-chips">
@@ -402,6 +404,7 @@
             <div class="review-frag" id="review-modal-fragment"></div>
           </div>
         </div>
+        <div id="review-modal-status" class="review-status"></div>
         <div class="form-group" id="review-new-answer-group">
           <label>Новая оценка (если апелляцию принимаете):</label>
           <select id="review-modal-new-answer" class="form-control"></select>
