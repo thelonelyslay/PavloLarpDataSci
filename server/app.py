@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import importlib
 import os
 import ssl
 import sqlite3
@@ -13,8 +14,11 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 import certifi
 
 from src.cqa.scoring import validate_checklist
@@ -183,6 +187,22 @@ app.add_middleware(
 )
 
 
+@app.exception_handler(StarletteHTTPException)
+async def http_error_handler(_, exc: StarletteHTTPException):
+    detail = "Ресурс не найден" if exc.status_code == 404 and exc.detail == "Not Found" else exc.detail
+    return JSONResponse(status_code=exc.status_code, content={"status": "error", "detail": detail})
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(_, __: RequestValidationError):
+    return JSONResponse(status_code=422, content={"status": "error", "detail": "Неверный формат запроса"})
+
+
+@app.exception_handler(Exception)
+async def unexpected_error_handler(_, __: Exception):
+    return JSONResponse(status_code=500, content={"status": "error", "detail": "Внутренняя ошибка сервера"})
+
+
 @app.get("/api/health")
 def health() -> dict:
     with _connect() as db:
@@ -202,7 +222,7 @@ def get_checklist(checklist_id: str) -> dict:
     with _connect() as db:
         row = db.execute("SELECT * FROM checklists WHERE id = ?", (checklist_id,)).fetchone()
     if row is None:
-        raise HTTPException(status_code=404, detail="Checklist not found")
+        raise HTTPException(status_code=404, detail="Чек-лист не найден")
     return _checklist_response(row, include_json=True)
 
 
@@ -212,11 +232,11 @@ def create_checklist(checklist: dict) -> dict:
     channel = checklist.get("applies_to")
     name = checklist.get("name")
     if channel not in ("agent chat", "voice call") or not isinstance(name, str) or not name.strip():
-        raise HTTPException(status_code=422, detail="name and valid applies_to are required")
+        raise HTTPException(status_code=422, detail="Укажите название и допустимый канал чек-листа")
     try:
         validate_checklist(checklist)
     except (ValueError, KeyError, TypeError) as exc:
-        raise HTTPException(status_code=422, detail=f"Invalid checklist: {exc}") from None
+        raise HTTPException(status_code=422, detail=f"Неверный чек-лист: {exc}") from None
     new_id = uuid4().hex
     with _connect() as db:
         db.execute("BEGIN IMMEDIATE")
@@ -224,9 +244,9 @@ def create_checklist(checklist: dict) -> dict:
         if base_id:
             base = db.execute("SELECT name, applies_to FROM checklists WHERE id = ?", (base_id,)).fetchone()
             if base is None:
-                raise HTTPException(status_code=404, detail="Base checklist not found")
+                raise HTTPException(status_code=404, detail="Исходный чек-лист не найден")
             if base["name"] != name or base["applies_to"] != channel:
-                raise HTTPException(status_code=422, detail="Base checklist name or channel differs")
+                raise HTTPException(status_code=422, detail="Название или канал исходного чек-листа не совпадает")
         version = db.execute("SELECT COALESCE(MAX(version), 0) + 1 FROM checklists WHERE name = ? AND applies_to = ?",
                              (name, channel)).fetchone()[0]
         stored = {k: v for k, v in checklist.items() if k not in ("id", "base_id", "active")}
@@ -245,22 +265,75 @@ def activate_checklist(checklist_id: str) -> dict:
         db.execute("BEGIN IMMEDIATE")
         row = db.execute("SELECT * FROM checklists WHERE id = ?", (checklist_id,)).fetchone()
         if row is None:
-            raise HTTPException(status_code=404, detail="Checklist not found")
+            raise HTTPException(status_code=404, detail="Чек-лист не найден")
         db.execute("UPDATE checklists SET active = 0 WHERE applies_to = ?", (row["applies_to"],))
         db.execute("UPDATE checklists SET active = 1 WHERE id = ?", (checklist_id,))
         row = db.execute("SELECT * FROM checklists WHERE id = ?", (checklist_id,)).fetchone()
     return _checklist_response(row)
 
 
+@app.post("/api/checklists/{checklist_id}/recalculate", status_code=202)
+def recalculate_checklist(checklist_id: str) -> dict:
+    with _connect() as db:
+        checklist = db.execute("SELECT applies_to FROM checklists WHERE id = ?", (checklist_id,)).fetchone()
+        if checklist is None:
+            raise HTTPException(status_code=404, detail="Чек-лист не найден")
+        rows = db.execute("SELECT id FROM conversations WHERE channel = ? ORDER BY id",
+                          (checklist["applies_to"],)).fetchall()
+    ids = [row["id"] for row in rows]
+    return importlib.import_module("server.evaluations").start_batch_job(ids, checklist_id)
+
+
 @app.get("/api/conversations")
-def list_conversations() -> list[dict]:
+def list_conversations(gross_error: bool | None = None) -> list[dict]:
     with _connect() as db:
         rows = db.execute("""SELECT c.id, c.channel, c.language,
             (SELECT e.total FROM evaluations e WHERE e.conversation_id = c.id
-             ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1) AS total
+             ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1) AS total,
+            (SELECT e.id FROM evaluations e WHERE e.conversation_id = c.id
+             ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1) AS last_evaluation_id,
+            (SELECT e.result_json FROM evaluations e WHERE e.conversation_id = c.id
+             ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1) AS last_result,
+            EXISTS (SELECT 1 FROM appeals a JOIN evaluations e ON e.id = a.evaluation_id
+                    WHERE e.conversation_id = c.id AND a.status = 'open') AS has_appeal
             FROM conversations c ORDER BY c.id""").fetchall()
-    return [{"id": row["id"], "channel": row["channel"], "language": row["language"],
-             "total": row["total"]} for row in rows]
+    result = []
+    for row in rows:
+        evaluation = json.loads(row["last_result"]) if row["last_result"] else None
+        item = {"id": row["id"], "channel": row["channel"], "language": row["language"],
+                "total": row["total"], "last_evaluation_id": row["last_evaluation_id"],
+                "gross_error": bool(evaluation and evaluation.get("gross_error")),
+                "has_appeal": bool(row["has_appeal"]),
+                "status": evaluation.get("status") if evaluation else None}
+        if gross_error is None or item["gross_error"] == gross_error:
+            result.append(item)
+    return result
+
+
+@app.post("/api/conversations", status_code=201)
+def create_conversation(record: dict) -> dict:
+    conversation_id = record.get("conversation_id") or record.get("id")
+    channel = record.get("channel")
+    language = record.get("language")
+    transcript = record.get("transcript")
+    if not isinstance(conversation_id, str) or not conversation_id.strip():
+        raise HTTPException(status_code=422, detail="Укажите conversation_id диалога")
+    if channel not in ("agent chat", "voice call"):
+        raise HTTPException(status_code=422, detail="Укажите канал: agent chat или voice call")
+    if language not in ("RU", "KZ", "EN"):
+        raise HTTPException(status_code=422, detail="Укажите язык: RU, KZ или EN")
+    if not isinstance(transcript, list) or not transcript or any(
+        not isinstance(m, dict) or not isinstance(m.get("speaker"), str)
+        or not isinstance(m.get("text"), str) for m in transcript
+    ):
+        raise HTTPException(status_code=422, detail="Транскрипт должен содержать реплики speaker и text")
+    with _connect() as db:
+        db.execute("""INSERT INTO conversations (id, channel, language, transcript, audio_url)
+            VALUES (?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET
+            channel=excluded.channel, language=excluded.language,
+            transcript=excluded.transcript, audio_url=excluded.audio_url""",
+            (conversation_id, channel, language, json.dumps(transcript, ensure_ascii=False), record.get("audio_url")))
+    return get_conversation(conversation_id)
 
 
 @app.get("/api/conversations/{conversation_id}")
@@ -268,7 +341,7 @@ def get_conversation(conversation_id: str) -> dict:
     with _connect() as db:
         row = db.execute("SELECT * FROM conversations WHERE id = ?", (conversation_id,)).fetchone()
     if row is None:
-        raise HTTPException(status_code=404, detail="Conversation not found")
+        raise HTTPException(status_code=404, detail="Диалог не найден")
     return {"id": row["id"], "channel": row["channel"], "language": row["language"],
             "transcript": json.loads(row["transcript"]), "audio_url": row["audio_url"]}
 
@@ -296,14 +369,15 @@ def view_conversation(conversation_id: str) -> str:
 @app.post("/api/conversations/sync")
 def sync_conversations() -> dict:
     if not DEV_PATH.exists() and not os.environ.get("DATA_API_URL", "").strip():
-        raise HTTPException(status_code=503, detail="DEV data source is not configured")
+        raise HTTPException(status_code=503, detail="Источник DEV-диалогов не настроен")
     try:
         count = import_conversations()
     except (HTTPError, URLError, TimeoutError, ValueError, OSError):
-        raise HTTPException(status_code=502, detail="Data API import failed") from None
+        raise HTTPException(status_code=502, detail="Не удалось загрузить диалоги из DEV API") from None
     return {"imported": count}
 
 
 from .evaluations import router as evaluations_router  # noqa: E402
 
 app.include_router(evaluations_router)
+app.mount("/", StaticFiles(directory=ROOT / "web", html=True), name="web")

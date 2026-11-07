@@ -6,6 +6,7 @@ import importlib
 import json
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from pathlib import Path
@@ -17,6 +18,8 @@ from fastapi.responses import JSONResponse
 from src.cqa.scoring import score
 router = APIRouter(prefix="/api")
 ROOT = Path(__file__).resolve().parents[1]
+_jobs: dict[str, dict] = {}
+_jobs_lock = threading.Lock()
 
 
 def _connect():
@@ -82,15 +85,23 @@ def _load_evaluation(evaluation_id: str) -> tuple[dict, dict]:
     with _connect() as db:
         row = db.execute("SELECT * FROM evaluations WHERE id = ?", (evaluation_id,)).fetchone()
     if row is None:
-        raise HTTPException(status_code=404, detail="Evaluation not found")
+        raise HTTPException(status_code=404, detail="Оценка не найдена")
     return dict(row), json.loads(row["result_json"])
 
 
 @router.post("/evaluations")
 def create_evaluation(request: dict) -> dict:
+    supplied = request.get("conversation") or request.get("record")
+    if supplied is None and "transcript" in request:
+        supplied = request
+    if supplied is not None:
+        if not isinstance(supplied, dict):
+            raise HTTPException(status_code=422, detail="Диалог должен быть объектом JSON")
+        importlib.import_module("server.app").create_conversation(supplied)
+        request = {**request, "conversation_id": supplied.get("conversation_id") or supplied.get("id")}
     conversation_id = request.get("conversation_id")
     if not isinstance(conversation_id, str) or not conversation_id:
-        raise HTTPException(status_code=422, detail="conversation_id is required")
+        raise HTTPException(status_code=422, detail="Укажите conversation_id")
     record = get_conversation(conversation_id)
     with _connect() as db:
         if request.get("checklist_id"):
@@ -98,10 +109,10 @@ def create_evaluation(request: dict) -> dict:
         else:
             row = db.execute("SELECT * FROM checklists WHERE applies_to = ? AND active = 1", (record["channel"],)).fetchone()
     if row is None:
-        raise HTTPException(status_code=404, detail="Checklist not found for conversation")
+        raise HTTPException(status_code=404, detail="Чек-лист для диалога не найден")
     checklist = json.loads(row["checklist_json"])
     if row["applies_to"] != record["channel"]:
-        raise HTTPException(status_code=422, detail="Checklist channel differs from conversation channel")
+        raise HTTPException(status_code=422, detail="Канал чек-листа не совпадает с каналом диалога")
     source = json.dumps({"conversation_id": record["id"], "transcript": record["transcript"], "language": record["language"],
                          "channel": record["channel"], "checklist": checklist, "checklist_id": row["id"],
                          "models": os.environ.get("EVAL_MODELS", "")}, sort_keys=True, ensure_ascii=False)
@@ -126,7 +137,7 @@ def create_evaluation(request: dict) -> dict:
     except (EngineEvaluationError, EngineChecklistError) as exc:
         status_code = 422 if isinstance(exc, EngineChecklistError) else 502
         result = {"id": uuid4().hex, "conversation_id": conversation_id, "checklist_id": row["id"],
-                  "checklist_version": row["version"], "status": "error", "error": str(exc),
+                  "checklist_version": row["version"], "status": "error", "error": f"Ошибка оценки: {exc}",
                   "model": None, "total": None, "original_total": None, "criteria": []}
         with _connect() as db:
             db.execute("""INSERT INTO evaluations (id, conversation_id, checklist_id, checklist_version,
@@ -148,11 +159,22 @@ def get_evaluation(evaluation_id: str) -> dict:
     return _load_evaluation(evaluation_id)[1]
 
 
+@router.get("/evaluations")
+def list_evaluations(conversation_id: str | None = None) -> list[dict]:
+    with _connect() as db:
+        if conversation_id:
+            rows = db.execute("SELECT result_json FROM evaluations WHERE conversation_id = ? ORDER BY created_at, rowid",
+                              (conversation_id,)).fetchall()
+        else:
+            rows = db.execute("SELECT result_json FROM evaluations ORDER BY created_at DESC, rowid DESC LIMIT 100").fetchall()
+    return [json.loads(row["result_json"]) for row in rows]
+
+
 @router.post("/evaluations/batch")
 def create_batch(request: dict) -> dict:
     ids = request.get("conversation_ids")
     if not isinstance(ids, list) or not ids or any(not isinstance(cid, str) for cid in ids):
-        raise HTTPException(status_code=422, detail="conversation_ids must be a nonempty string list")
+        raise HTTPException(status_code=422, detail="conversation_ids должен быть непустым списком ID")
     timeout = 210
     results = []
     for cid in ids:
@@ -165,43 +187,82 @@ def create_batch(request: dict) -> dict:
                 evaluation = task.result(timeout=timeout)
                 if isinstance(evaluation, JSONResponse):
                     raise HTTPException(status_code=evaluation.status_code,
-                                        detail=json.loads(evaluation.body).get("error", "Evaluation failed"))
+                                        detail=json.loads(evaluation.body).get("error", "Ошибка оценки"))
                 results.append({"conversation_id": cid, "evaluation": evaluation})
                 last_error = None
                 break
             except FutureTimeout:
                 task.cancel()
-                last_error = "timeout"
+                last_error = "Превышено время ожидания оценки"
                 break  # The timed-out worker may still be running; avoid a duplicate model call.
             except HTTPException as exc:
                 last_error = exc.detail
                 if exc.status_code < 500:
                     break
             except Exception as exc:
-                last_error = type(exc).__name__
+                last_error = "Внутренняя ошибка при оценке диалога"
             finally:
                 pool.shutdown(wait=False, cancel_futures=True)
             if attempt < 2:
                 time.sleep(2 ** attempt)
         if last_error is not None:
-            results.append({"conversation_id": cid, "error": last_error})
-    return {"results": results}
+            results.append({"conversation_id": cid, "status": "error", "error": last_error})
+    return {"status": "done", "completed": len(results), "total": len(ids), "results": results}
+
+
+def _run_batch_job(job_id: str, ids: list[str], checklist_id: str | None) -> None:
+    for cid in ids:
+        result = create_batch({"conversation_ids": [cid], "checklist_id": checklist_id})["results"][0]
+        with _jobs_lock:
+            job = _jobs[job_id]
+            job["results"].append(result)
+            job["completed"] += 1
+    with _jobs_lock:
+        _jobs[job_id]["status"] = "done"
+
+
+def start_batch_job(ids: list[str], checklist_id: str | None) -> dict:
+    if not ids:
+        raise HTTPException(status_code=422, detail="Нет диалогов для пакетной оценки")
+    job_id = uuid4().hex
+    job = {"id": job_id, "status": "running", "completed": 0, "total": len(ids), "results": []}
+    with _jobs_lock:
+        _jobs[job_id] = job
+    threading.Thread(target=_run_batch_job, args=(job_id, ids, checklist_id), daemon=True).start()
+    return dict(job)
+
+
+@router.post("/evaluations/batch/start", status_code=202)
+def start_batch(request: dict) -> dict:
+    ids = request.get("conversation_ids")
+    if not isinstance(ids, list) or any(not isinstance(cid, str) for cid in ids):
+        raise HTTPException(status_code=422, detail="conversation_ids должен быть списком ID")
+    return start_batch_job(ids, request.get("checklist_id"))
+
+
+@router.get("/evaluations/batch/{job_id}")
+def batch_progress(job_id: str) -> dict:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Пакетная задача не найдена")
+        return {**job, "results": list(job["results"])}
 
 
 @router.post("/evaluations/{evaluation_id}/appeals", status_code=201)
 def create_appeal(evaluation_id: str, request: dict) -> dict:
     _, result = _load_evaluation(evaluation_id)
     if result["status"] == "error":
-        raise HTTPException(status_code=409, detail="Failed evaluation cannot be appealed")
+        raise HTTPException(status_code=409, detail="Нельзя подать апелляцию на неудавшуюся оценку")
     criterion_id, comment = request.get("criterion_id"), request.get("comment")
     if not isinstance(comment, str) or not comment.strip() or criterion_id not in {c["id"] for c in result["criteria"]}:
-        raise HTTPException(status_code=422, detail="Valid criterion_id and comment are required")
+        raise HTTPException(status_code=422, detail="Укажите критерий и комментарий к апелляции")
     appeal_id = uuid4().hex
     with _connect() as db:
         existing = db.execute("""SELECT 1 FROM appeals WHERE evaluation_id = ? AND criterion_id = ? AND status = 'open'""",
                               (evaluation_id, criterion_id)).fetchone()
         if existing:
-            raise HTTPException(status_code=409, detail="Criterion already has an open appeal")
+            raise HTTPException(status_code=409, detail="По критерию уже есть открытая апелляция")
         db.execute("INSERT INTO appeals (id, evaluation_id, criterion_id, comment) VALUES (?, ?, ?, ?)",
                    (appeal_id, evaluation_id, criterion_id, comment))
         criterion = next(c for c in result["criteria"] if c["id"] == criterion_id)
@@ -223,14 +284,14 @@ def list_appeals(status: str = "open") -> list[dict]:
 def decide_appeal(appeal_id: str, request: dict) -> dict:
     decision, reason = request.get("decision"), request.get("reason")
     if decision not in ("confirm", "change") or not isinstance(reason, str) or not reason.strip():
-        raise HTTPException(status_code=422, detail="decision and reason are required")
+        raise HTTPException(status_code=422, detail="Укажите решение и его причину")
     with _connect() as db:
         db.execute("BEGIN IMMEDIATE")
         appeal = db.execute("SELECT * FROM appeals WHERE id = ?", (appeal_id,)).fetchone()
         if appeal is None:
-            raise HTTPException(status_code=404, detail="Appeal not found")
+            raise HTTPException(status_code=404, detail="Апелляция не найдена")
         if appeal["status"] != "open":
-            raise HTTPException(status_code=409, detail="Appeal already decided")
+            raise HTTPException(status_code=409, detail="Решение по апелляции уже принято")
         evaluation = db.execute("SELECT * FROM evaluations WHERE id = ?", (appeal["evaluation_id"],)).fetchone()
         checklist_row = db.execute("SELECT checklist_json FROM checklists WHERE id = ?", (evaluation["checklist_id"],)).fetchone()
         checklist = json.loads(checklist_row["checklist_json"])
@@ -239,12 +300,12 @@ def decide_appeal(appeal_id: str, request: dict) -> dict:
         final = {c["id"]: c["final_answer"] for c in result["criteria"]}
         if decision == "change":
             if "new_answer" not in request:
-                raise HTTPException(status_code=422, detail="new_answer is required for change")
+                raise HTTPException(status_code=422, detail="Для изменения укажите новый ответ")
             final[appeal["criterion_id"]] = request["new_answer"]
         try:
             score(checklist, final)
         except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from None
+            raise HTTPException(status_code=422, detail=f"Недопустимый ответ для критерия: {exc}") from None
         criterion = next(c for c in result["criteria"] if c["id"] == appeal["criterion_id"])
         criterion["appeal"] = {"comment": appeal["comment"], "status": "decided",
                                "decision": decision, "reason": reason}
