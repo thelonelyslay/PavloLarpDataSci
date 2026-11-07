@@ -1,6 +1,8 @@
 """Build data/labels.json from manual label files docs/labels_*.csv (except labels_template.csv).
 
 CSV columns: conversation_id,criterion,answer,message_index,reason
+- criterion: id (contact, needs, ...) in any case, or number 1..N in the checklist order;
+- answer: yes/no/na or a scale step, any case; n/a, N/A, NA mean na; да/нет also work;
 - extra columns (unquoted commas in reason) are glued back into reason;
 - rows with an empty answer are skipped;
 - answers are checked against the checklist of the dialog's channel
@@ -18,12 +20,26 @@ import json
 from pathlib import Path
 from typing import Any, Optional
 
-from prompting import answer_options
+from prompting import answer_options, criteria_sorted
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 FIELDS = ["conversation_id", "criterion", "answer", "message_index", "reason"]
-ALIASES = {"да": "yes", "нет": "no", "n/a": "na", "н/п": "na", "true": "yes", "false": "no"}
+ALIASES = {"да": "yes", "нет": "no", "n/a": "na", "n.a.": "na", "н/п": "na", "н/а": "na",
+           "true": "yes", "false": "no"}
+
+
+def resolve_criterion(checklist: dict, raw: str) -> tuple[Optional[dict], str]:
+    """Criterion by id (case-insensitive) or by number 1..N in checklist order; (None, why) if not found."""
+    key = raw.strip()
+    ordered = criteria_sorted(checklist)
+    if key.isdigit():
+        n = int(key)
+        if 1 <= n <= len(ordered):
+            return ordered[n - 1], ""
+        return None, f"criterion number {n} out of range 1..{len(ordered)}"
+    found = next((c for c in ordered if c["id"].lower() == key.lower()), None)
+    return found, "" if found else f"unknown criterion {raw!r}"
 
 
 def load_checklists() -> tuple[dict, dict]:
@@ -97,10 +113,11 @@ def build(docs: Path, dev: Path) -> tuple[dict, dict, list[str], int]:
                 errors.append(f"{where}: empty conversation_id or criterion")
                 continue
             checklist = by_channel.get(channels.get(conv), default)
-            criterion = next((c for c in checklist["criteria"] if c["id"] == crit), None)
+            criterion, why = resolve_criterion(checklist, crit)
             if criterion is None:
-                errors.append(f"{where}: unknown criterion {crit!r}")
+                errors.append(f"{where}: {why}")
                 continue
+            crit = criterion["id"]
             value = normalize(criterion, r["answer"])
             if value is None:
                 errors.append(f"{where}: {conv}/{crit}: answer {r['answer']!r} not in {answer_options(criterion)}")
