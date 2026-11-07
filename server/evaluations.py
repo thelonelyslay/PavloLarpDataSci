@@ -275,10 +275,28 @@ def create_appeal(evaluation_id: str, request: dict) -> dict:
 
 
 @router.get("/appeals")
-def list_appeals(status: str = "open") -> list[dict]:
+def list_appeals(status: Optional[str] = None) -> list[dict]:
+    if status not in (None, "open", "decided"):
+        raise HTTPException(status_code=422, detail="Неизвестный статус апелляции")
     with _connect() as db:
-        rows = db.execute("SELECT * FROM appeals WHERE status = ? ORDER BY created_at, rowid", (status,)).fetchall()
-    return [dict(row) for row in rows]
+        rows = db.execute("""SELECT a.*, e.conversation_id, e.checklist_version, e.result_json,
+            d.decision, d.new_answer, d.reason
+            FROM appeals a
+            JOIN evaluations e ON e.id = a.evaluation_id
+            LEFT JOIN decisions d ON d.appeal_id = a.id
+            WHERE (? IS NULL OR a.status = ?)
+            ORDER BY a.created_at, a.rowid""", (status, status)).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        evaluation = json.loads(item.pop("result_json"))
+        criterion = next((c for c in evaluation.get("criteria", []) if c["id"] == item["criterion_id"]), {})
+        item["criterion_title"] = criterion.get("title", item["criterion_id"])
+        item["final_answer"] = criterion.get("final_answer", criterion.get("answer"))
+        if item["new_answer"] is not None:
+            item["new_answer"] = json.loads(item["new_answer"])
+        result.append(item)
+    return result
 
 
 @router.post("/appeals/{appeal_id}/decision")

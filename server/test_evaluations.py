@@ -42,7 +42,19 @@ class EvaluationFlowTest(unittest.TestCase):
                     self.assertLess(revised["total"], first["total"])
                     self.assertEqual(revised["original_total"], first["total"])
                     self.assertEqual(evaluations.get_evaluation(first["id"])["total"], revised["total"])
-                    self.assertNotEqual(evaluations.create_evaluation({"conversation_id": "test-1"})["id"], first["id"])
+                    self.assertEqual(len(evaluations.list_appeals()), 1)
+                    self.assertEqual(evaluations.list_appeals()[0]["status"], "decided")
+                    second_appeal = evaluations.create_appeal(first["id"],
+                                                               {"criterion_id": "contact", "comment": "Second review"})
+                    evaluations.decide_appeal(second_appeal["id"],
+                                              {"decision": "confirm", "reason": "Confirmed"})
+                    self.assertEqual(len(evaluations.list_appeals()), 2)
+                    next_checklist = app.create_checklist(app.get_checklist(first["checklist_id"]))
+                    app.activate_checklist(next_checklist["id"])
+                    newer = evaluations.create_evaluation({"conversation_id": "test-1"})
+                    self.assertGreater(newer["checklist_version"], first["checklist_version"])
+                    self.assertEqual(len(evaluations.list_appeals("decided")), 2)
+                    self.assertNotEqual(newer["id"], first["id"])
                     self.assertEqual(model.call_count, 2)
 
     def test_engine_error_is_saved_as_error_result(self):

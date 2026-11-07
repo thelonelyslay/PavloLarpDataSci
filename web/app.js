@@ -21,6 +21,7 @@
       status: 'all'
     },
     appeals: [],
+    appealRecords: null,
     evalById: {},
     batch: null,
     isLoading: false,
@@ -142,12 +143,11 @@
     } catch (e) { /* older server: no list */ }
     const want = new Set();
     state.conversations.forEach(c => { if (c.last_evaluation_id && !state.evalById[c.last_evaluation_id]) want.add(c.last_evaluation_id); });
-    for (const st of ['open', 'decided']) {
-      try {
-        const list = await api().getAppeals(st);
-        (Array.isArray(list) ? list : []).forEach(a => { if (!state.evalById[a.evaluation_id]) want.add(a.evaluation_id); });
-      } catch (e) { /* appeals list unavailable */ }
-    }
+    try {
+      const list = await api().getAppeals();
+      state.appealRecords = Array.isArray(list) ? list : [];
+      state.appealRecords.forEach(a => { if (!state.evalById[a.evaluation_id]) want.add(a.evaluation_id); });
+    } catch (e) { state.appealRecords = null; /* older server: use evaluation snapshots */ }
     const ids = [...want];
     for (let i = 0; i < ids.length; i += 6) {
       await Promise.all(ids.slice(i, i + 6).map(async id => {
@@ -258,6 +258,27 @@
 
   function collectAppeals() {
     state.appeals = [];
+    if (isLive() && Array.isArray(state.appealRecords)) {
+      for (const row of state.appealRecords) {
+        const ev = state.evalById[row.evaluation_id];
+        const crit = ev && (ev.criteria || []).find(c => c.id === row.criterion_id);
+        const answer = row.decision === 'change' && row.new_answer !== null ? row.new_answer
+          : row.final_answer !== undefined ? row.final_answer : crit ? finalAnswer(crit) : null;
+        state.appeals.push({
+          evaluation_id: row.evaluation_id,
+          conversation_id: row.conversation_id || (ev && ev.conversation_id),
+          criterion_id: row.criterion_id,
+          criterion_title: row.criterion_title || (crit && crit.title) || row.criterion_id,
+          answer,
+          view: answerView(critDef(ev, row.criterion_id), crit || {}, answer),
+          appeal: { id: row.id, comment: row.comment, status: row.status,
+            decision: row.decision, reason: row.reason, new_answer: row.new_answer }
+        });
+      }
+      state.appeals.sort((x, y) => (x.appeal.status === 'open' ? 0 : 1) - (y.appeal.status === 'open' ? 0 : 1));
+      updateAppealsBadge();
+      return;
+    }
     const evs = Object.values(state.evalById).length ? Object.values(state.evalById) : Object.values(state.evaluations);
     const seen = new Set();
     for (const ev of evs) {
@@ -1105,7 +1126,7 @@
               Принять решение
             </button>
           ` : `
-            <div class="ap-decision ${accepted ? 'acc' : 'rej'}">${accepted ? 'Принята' : 'Отклонена'}${accepted ? `: ${answerView(def, crit, orig).text} → ${answerView(def, crit).text}` : ''}</div>
+            <div class="ap-decision ${accepted ? 'acc' : 'rej'}">${accepted ? 'Принята' : 'Отклонена'}${accepted ? `: ${answerView(def, crit, orig).text} → ${answerView(def, crit, item.answer).text}` : ''}</div>
             ${accepted && ev.original_total !== ev.total ? `<div class="ap-total">Итог ${fmtShort(ev.original_total)} → <b>${fmtShort(ev.total)}</b></div>` : ''}
             <div class="ap-reason">${escapeHtml(item.appeal.reason || '')}</div>
             <button class="chip-btn" onclick="app.openReviewModal('${escapeHtml(item.evaluation_id)}', '${escapeHtml(item.criterion_id)}')">Открыть</button>
@@ -1362,6 +1383,9 @@
       if (state.evalById[evId]) fresh._seq = state.evalById[evId]._seq;
       storeEval(fresh);
     }
+    if (isLive()) {
+      try { state.appealRecords = await api().getAppeals(); } catch (e) { state.appealRecords = null; }
+    }
     collectAppeals();
     renderAll();
   }
@@ -1449,7 +1473,13 @@
       const appealId = await findAppealId(ev, critId);
       const updated = await api().decideAppeal(appealId, decisionType, decisionType === 'change' ? newAnswer : undefined, reason);
       closeModal('review-modal');
-      if (updated && updated.id) { updated._seq = ev._seq; storeEval(updated); collectAppeals(); renderAll(); }
+      if (updated && updated.id) {
+        updated._seq = ev._seq;
+        storeEval(updated);
+        try { state.appealRecords = await api().getAppeals(); } catch (e) { state.appealRecords = null; }
+        collectAppeals();
+        renderAll();
+      }
       else await refreshEvaluation(ev.conversation_id, ev.id);
       const after = (state.evalById[evalId] || {}).total;
       toast(decisionType === 'change' ? `Апелляция принята. Итог: ${fmtShort(before)} → ${fmtShort(after)} (пересчитал сервер)` : 'Апелляция отклонена, оценка оставлена');
