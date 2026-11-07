@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Freedom Broker CQA · Оценка качества диалогов</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <div class="shell">
+  <!-- SIDE NAVIGATION -->
+  <aside class="side-nav">
+    <div class="side-logo">CQA<span>Freedom Broker</span></div>
+    <nav class="side-menu">
+      <button class="nav-tab-btn active" data-tab="tab-workspace" id="nav-btn-workspace">
+        <svg viewBox="0 0 24 24"><path d="M4 5h16v11H8l-4 4z"/></svg><span>Диалоги</span>
+      </button>
+      <button class="nav-tab-btn" data-tab="tab-checklist" id="nav-btn-checklist">
+        <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8 12l3 3 5-6"/></svg><span>Чек-листы</span>
+      </button>
+      <button class="nav-tab-btn" data-tab="tab-appeals" id="nav-btn-appeals">
+        <svg viewBox="0 0 24 24"><path d="M12 4v16M6 20h12M5 8h14M5 8l-3 6h6zM19 8l-3 6h6z"/></svg><span>Апелляции</span>
+        <span class="nav-badge" id="appeals-badge-count" style="display: none;">0</span>
+      </button>
+      <button class="nav-tab-btn" data-tab="tab-analytics" id="nav-btn-analytics">
+        <svg viewBox="0 0 24 24"><path d="M6 20V12M12 20V6M18 20v-9"/></svg><span>Аналитика</span>
+      </button>
+    </nav>
+    <div class="side-bottom">
+      <label class="side-label">Активный чек-лист</label>
+      <select id="checklist-picker" class="checklist-selector" title="Активный чек-лист (загружается с сервера)"></select>
+      <div class="api-status" id="api-status-pill" onclick="app.openApiModal()" title="Источник данных: нажмите, чтобы указать адрес сервера">
+        <span class="status-dot"></span>
+        <span id="api-status-text">Подключение…</span>
+      </div>
+    </div>
+  </aside>
+
+  <div class="shell-main">
+
+  <!-- DEMO MODE BANNER: shown when the server is unavailable -->
+  <div id="demo-mode-banner" class="demo-mode-banner" style="display: none;">
+    <strong>ДЕМО-ДАННЫЕ</strong>
+    <span>Сервер недоступен. Показаны синтетические диалоги и заранее заданные демо-оценки только для проверки интерфейса. Оценка, апелляции и сохранение чек-листа работают только с сервером.</span>
+    <button class="btn-retry" onclick="app.openApiModal()">Подключить сервер</button>
+  </div>
+
+  <!-- GLOBAL ERROR / LOADING BANNERS -->
+  <div id="global-error-banner" class="global-error-banner" style="display: none;">
+    <span id="global-error-text">Ошибка подключения к API</span>
+    <button class="btn-retry" onclick="app.reloadConversations()">Повторить попытку</button>
+  </div>
+
+  <!-- MAIN APP CONTAINER -->
+  <main class="app-container">
+
+    <!-- TAB 1: WORKSPACE (3 COLUMNS) -->
+    <div class="tab-content active" id="tab-workspace">
+      <div class="workspace-grid">
+        
+        <!-- COLUMN 1: SIDEBAR (CONVERSATIONS LIST) -->
+        <aside class="sidebar-conversations">
+          <div class="sidebar-header">
+            <div class="search-box">
+              <span class="search-icon">🔍</span>
+              <input type="text" id="conv-search-input" class="search-input" placeholder="Поиск по ID или тексту...">
+            </div>
+
+            <div class="filter-chips">
+              <button class="chip-btn active" data-filter="all">Все</button>
+              <button class="chip-btn" data-filter="chat">💬 Чаты</button>
+              <button class="chip-btn" data-filter="voice">📞 Звонки</button>
+              <button class="chip-btn" data-filter="error">⚠️ Нарушения</button>
+              <button class="chip-btn" data-filter="appeal">⚖️ Апелляции</button>
+            </div>
+
+            <div class="filter-chips" style="border-top: 1px dashed var(--border); padding-top: 6px;">
+              <span style="font-size: 11px; color: var(--text-muted); align-self: center;">Язык:</span>
+              <button class="chip-btn active" data-lang="all">Все</button>
+              <button class="chip-btn" data-lang="RU">RU</button>
+              <button class="chip-btn" data-lang="KZ">KZ</button>
+              <button class="chip-btn" data-lang="EN">EN</button>
+            </div>
+          </div>
+
+          <div class="conversations-list" id="conversations-list">
+            <!-- Dynamically populated via app.js -->
+          </div>
+        </aside>
+
+        <!-- MAIN: CONVERSATION ANALYSIS -->
+        <section class="analysis">
+          <div class="analysis-head">
+            <div>
+              <h1>Анализ разговора</h1>
+              <div class="analysis-sub" id="active-conv-sub">—</div>
+              <div id="active-conv-title" class="analysis-tags"></div>
+            </div>
+            <div id="transcript-actions"></div>
+          </div>
+
+          <!-- TIMELINE: client / operator lanes + player -->
+          <div class="card timeline-card">
+            <div class="lanes" id="timeline-lanes">
+              <div class="lane"><span class="lane-label">Клиент</span><div class="lane-bars" id="lane-client"></div></div>
+              <div class="lane"><span class="lane-label">Оператор</span><div class="lane-bars" id="lane-operator"></div></div>
+              <div class="tl-highlight" id="tl-highlight" style="display: none;"></div>
+              <div class="tl-playhead" id="tl-playhead" style="display: none;"></div>
+            </div>
+            <div class="player-row" id="voice-audio-bar">
+              <button class="audio-btn" id="audio-play-btn" title="Воспроизвести / пауза">▶</button>
+              <span class="player-time"><span id="audio-time-current">00:00</span> / <span id="audio-time-duration">00:00</span></span>
+              <div class="audio-timeline"><input type="range" id="audio-seek" value="0" min="0" max="100"></div>
+              <select id="audio-speed" class="audio-speed-select">
+                <option value="0.75">0.75x</option>
+                <option value="1" selected>1x</option>
+                <option value="1.25">1.25x</option>
+                <option value="1.5">1.5x</option>
+                <option value="2">2x</option>
+              </select>
+              <a href="#" id="audio-external-link" target="_blank" class="ext-link" title="Открыть запись в новой вкладке">↗</a>
+              <audio id="html5-audio-element" preload="none"></audio>
+            </div>
+            <div class="tl-note" id="tl-note">Полосы показывают, кто и когда говорил, по меткам времени реплик (не по громкости записи).</div>
+          </div>
+
+          <div class="analysis-cols">
+            <!-- TRANSCRIPT -->
+            <div class="card transcript-card">
+              <h2 class="card-title">Расшифровка</h2>
+              <div class="chat-stream" id="chat-stream"></div>
+            </div>
+
+            <!-- QUALITY SUMMARY -->
+            <div class="card quality-card">
+              <div class="quality-title-row">
+                <h2 class="card-title">Оценка качества</h2>
+                <div class="score-label-badge badge-warning" id="score-status-badge">—</div>
+              </div>
+              <div class="quality-top">
+                <div class="score-ring">
+                  <svg viewBox="0 0 120 120"><circle cx="60" cy="60" r="50" class="ring-bg"/><circle cx="60" cy="60" r="50" class="ring-fg" id="score-ring"/></svg>
+                  <div class="ring-center"><b id="total-score-display">—</b><span>/ 100</span><span id="total-score-original" class="score-original" style="display: none;"></span></div>
+                </div>
+                <div class="crit-summary" id="criteria-summary"></div>
+              </div>
+              <div class="gross-error-banner" id="gross-error-banner" style="display: none;">
+                <span>⚠️</span><span id="gross-error-text">Грубая ошибка</span>
+              </div>
+              <div class="why-box">
+                <h3 id="why-title">Почему снижена оценка</h3>
+                <div id="why-text">—</div>
+              </div>
+              <div class="quality-actions">
+                <button class="btn-primary" id="btn-goto-fragment" disabled>Перейти к фрагменту</button>
+                <button class="btn-outline" id="btn-dispute" disabled>Оспорить оценку</button>
+              </div>
+              <div class="eval-meta-row">
+                <span id="eval-demo-tag" class="demo-tag" style="display: none;">ДЕМО-ДАННЫЕ</span>
+                <span id="eval-model-tag">Модель: —</span>
+                <span id="eval-cost-tag">Стоимость: —</span>
+                <span id="eval-version-tag">Чек-лист: —</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- DETAILS -->
+          <div class="card details-card">
+            <div class="details-head">
+              <h2 class="card-title">Подробно по критериям</h2>
+              <div class="sections-summary" id="sections-summary"></div>
+            </div>
+            <div class="criteria-container" id="criteria-container"></div>
+          </div>
+        </section>
+
+      </div>
+    </div>
+
+    <!-- TAB 2: APPEALS CENTER -->
+    <div class="tab-content" id="tab-appeals">
+      <div class="appeals-view-container">
+        <div class="view-header">
+          <div>
+            <h2>Центр апелляций и контроля качества (QC)</h2>
+            <p>Просмотр оспариваемых операторами оценок, пересмотр и утверждение финальных баллов</p>
+          </div>
+        </div>
+
+        <div class="data-table-card">
+          <table class="custom-table">
+            <thead>
+              <tr>
+                <th>ID диалога</th>
+                <th>Критерий</th>
+                <th>Текущая оценка</th>
+                <th>Комментарий апелляции</th>
+                <th>Статус</th>
+                <th>Действие проверяющего</th>
+              </tr>
+            </thead>
+            <tbody id="appeals-table-body">
+              <!-- Rendered dynamically -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 3: CHECKLIST CONFIGURATOR -->
+    <div class="tab-content" id="tab-checklist">
+      <div class="checklist-view-container">
+        <div class="view-header">
+          <div>
+            <h2>Конструктор чек-листа оценки качества</h2>
+            <p>Критерии, веса, формулировки, шкалы и правила. Изменения попадают в черновик; «Сохранить и применить» сохраняет новую версию на сервере (POST /api/checklists) и переоценивает диалоги.</p>
+          </div>
+          <div class="checklist-builder-actions">
+            <button class="btn-secondary" id="btn-reset-checklist">Отменить черновик</button>
+            <button class="btn-primary" id="btn-add-criterion">+ Добавить критерий</button>
+            <button class="btn-primary" id="btn-apply-checklist-changes" style="background: var(--primary-dark);">Сохранить и применить к диалогам</button>
+          </div>
+        </div>
+
+        <!-- CHECKLIST META & WEIGHT SUM INDICATOR -->
+        <div style="display: flex; justify-content: space-between; align-items: center; background: #ffffff; padding: 12px 18px; border: 1px solid var(--border); border-radius: var(--radius-md);">
+          <div style="display: flex; align-items: center; gap: 12px;">
+            <label style="font-weight: 600; font-size: 13px;">Тип диалогов (канал):</label>
+            <select id="checklist-channel-select" class="form-control" style="width: auto; padding: 4px 10px;">
+              <option value="agent chat">💬 Текстовые чаты (agent chat)</option>
+              <option value="voice call">📞 Голосовые звонки (voice call)</option>
+            </select>
+          </div>
+          <div id="checklist-weight-indicator" class="weight-indicator-badge">
+            <!-- Rendered by app.js: Сумма весов: 100 / 100 -->
+          </div>
+        </div>
+
+        <div class="data-table-card">
+          <table class="custom-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Секция</th>
+                <th>Критерий</th>
+                <th>Тип / условие N/A</th>
+                <th>Вес</th>
+                <th>N/A</th>
+                <th style="min-width: 220px;">Правила и уточнения (rules)</th>
+                <th>Действия</th>
+              </tr>
+            </thead>
+            <tbody id="checklist-table-body">
+              <!-- Rendered dynamically -->
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- TAB 3: ANALYTICS & EXECUTIVE REPORTING -->
+    <div class="tab-content" id="tab-analytics">
+      <div class="analytics-view-container">
+        <div class="view-header">
+          <div>
+            <h2>Сводная аналитика качества обслуживания (Executive QA Dashboard)</h2>
+            <p>Комплексный мониторинг соблюдения стандартов сервиса, эффективности работы операторов и комплаенс-рисков</p>
+          </div>
+          <div class="export-actions">
+            <button class="btn-secondary" id="btn-open-settings">⚙ Пороги отображения</button>
+            <button class="btn-secondary" id="btn-export-json">💾 Экспорт в JSON</button>
+            <button class="btn-primary" id="btn-export-csv">📥 Экспорт отчета в CSV</button>
+          </div>
+        </div>
+
+        <!-- TOP KPI CARDS -->
+        <div class="kpi-grid">
+          <div class="kpi-card">
+            <span class="kpi-title">Средний CQA Index</span>
+            <div class="kpi-val" id="kpi-avg-score">—</div>
+            <span class="kpi-sub" id="kpi-target-sub">Целевой уровень (настройка)</span>
+          </div>
+          <div class="kpi-card">
+            <span class="kpi-title">Проверено обращений</span>
+            <div class="kpi-val" id="kpi-total-convs">—</div>
+            <span class="kpi-sub" id="kpi-total-sub">—</span>
+          </div>
+          <div class="kpi-card">
+            <span class="kpi-title">Инциденты комплаенс</span>
+            <div class="kpi-val" id="kpi-gross-errors" style="color: var(--danger);">—</div>
+            <span class="kpi-sub">Грубые ошибки регламента</span>
+          </div>
+          <div class="kpi-card">
+            <span class="kpi-title">Индекс апелляций</span>
+            <div class="kpi-val" id="kpi-appeals-count" style="color: var(--warning);">—</div>
+            <span class="kpi-sub">Обращений на пересмотр</span>
+          </div>
+        </div>
+
+        <!-- ANALYTICS SECTIONS -->
+        <div class="analytics-charts-grid">
+          <div class="data-table-card" style="padding: 20px;">
+            <h3 style="font-size: 15px; margin-bottom: 14px;">Распределение качества диалогов</h3>
+            <div class="distrib-bars" id="distrib-bars-container">
+              <!-- Rendered dynamically -->
+            </div>
+          </div>
+
+          <div class="data-table-card" style="padding: 20px;">
+            <h3 style="font-size: 15px; margin-bottom: 14px;">Показатели по каналам и языковым группам</h3>
+            <div class="lang-channel-grid" id="lang-channel-grid"></div>
+          </div>
+        </div>
+
+        <!-- CRITERIA PERFORMANCE TABLE -->
+        <div class="data-table-card" style="padding: 20px;">
+          <h3 style="font-size: 15px; margin-bottom: 14px;">Соблюдение регламентов по критериям контроля качества</h3>
+          <table class="custom-table">
+            <thead>
+              <tr>
+                <th>Критерий оценки</th>
+                <th>Секция</th>
+                <th>Вес</th>
+                <th>Уровень соблюдения</th>
+                <th>Статус критерия</th>
+              </tr>
+            </thead>
+            <tbody id="analytics-criteria-body">
+              <!-- Rendered dynamically -->
+            </tbody>
+          </table>
+        </div>
+
+      </div>
+    </div>
+
+  </main>
+  </div>
+  </div>
+
+  <!-- MODAL: SUBMIT OPERATOR APPEAL -->
+  <div class="modal-overlay" id="appeal-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>Подача апелляции оператора</h3>
+        <button class="close-btn" onclick="app.closeModal('appeal-modal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Критерий для оспаривания:</label>
+          <input type="text" id="appeal-modal-criterion" class="form-control" readonly>
+          <input type="hidden" id="appeal-modal-criterion-id">
+        </div>
+        <div class="form-group">
+          <label>Текущая оценка ИИ:</label>
+          <input type="text" id="appeal-modal-current-score" class="form-control" readonly>
+        </div>
+        <div class="form-group">
+          <label>Комментарий оператора (аргументация):</label>
+          <textarea id="appeal-modal-comment" class="form-control" placeholder="Опишите, почему вы считаете оценку некорректной и укажите номер реплики..."></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" onclick="app.closeModal('appeal-modal')">Отмена</button>
+        <button class="btn-primary" id="btn-submit-appeal">Отправить апелляцию</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: SUPERVISOR REVIEW DECISION -->
+  <div class="modal-overlay" id="review-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>Решение проверяющего (QC Review)</h3>
+        <button class="close-btn" onclick="app.closeModal('review-modal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Диалог и критерий:</label>
+          <input type="text" id="review-modal-target" class="form-control" readonly>
+          <input type="hidden" id="review-modal-conv-id">
+          <input type="hidden" id="review-modal-criterion-id">
+        </div>
+        <div class="form-group">
+          <label>Комментарий оператора:</label>
+          <div id="review-modal-operator-comment" style="font-size: 12px; background: #fffbeb; padding: 8px 10px; border-radius: 6px; border: 1px solid #fde68a;"></div>
+        </div>
+        <div class="form-group">
+          <label>Решение проверяющего:</label>
+          <select id="review-modal-decision-type" class="form-control">
+            <option value="confirm">Подтвердить оценку</option>
+            <option value="change">Изменить оценку (итог пересчитает сервер)</option>
+          </select>
+        </div>
+        <div class="form-group" id="review-new-answer-group">
+          <label>Новая оценка:</label>
+          <select id="review-modal-new-answer" class="form-control"></select>
+        </div>
+        <div class="form-group">
+          <label>Обоснование решения проверяющего:</label>
+          <textarea id="review-modal-reason" class="form-control" placeholder="Укажите причину подтверждения или изменения оценки..."></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" onclick="app.closeModal('review-modal')">Отмена</button>
+        <button class="btn-primary" id="btn-apply-review-decision">Сохранить решение</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: EDIT / ADD CHECKLIST CRITERION -->
+  <div class="modal-overlay" id="criterion-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 id="criterion-modal-title">Редактирование критерия</h3>
+        <button class="close-btn" onclick="app.closeModal('criterion-modal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>ID критерия (уникальный):</label>
+          <input type="text" id="crit-edit-id" class="form-control">
+        </div>
+        <div class="form-group">
+          <label>Название критерия:</label>
+          <input type="text" id="crit-edit-title" class="form-control">
+        </div>
+        <div class="form-group">
+          <label>Секция:</label>
+          <input type="text" id="crit-edit-section" class="form-control" list="crit-edit-section-list" placeholder="Секция из чек-листа или новая">
+          <datalist id="crit-edit-section-list"></datalist>
+        </div>
+        <div class="form-group">
+          <label>Тип ответа:</label>
+          <select id="crit-edit-type" class="form-control">
+            <option value="yes_no">Да / Нет</option>
+            <option value="scale">Числовая шкала</option>
+            <option value="flag">Флаг грубой ошибки (без баллов)</option>
+          </select>
+        </div>
+        <div class="form-group" id="crit-edit-weight-group">
+          <label>Вес критерия:</label>
+          <input type="number" id="crit-edit-weight" class="form-control" min="0" max="100">
+        </div>
+        <div class="form-group">
+          <label>
+            <input type="checkbox" id="crit-edit-allow-na"> Разрешить оценку N/A (неприменимо)
+          </label>
+        </div>
+        <div class="form-group" id="crit-edit-na-group" style="display: none;">
+          <label>Условие N/A:</label>
+          <input type="text" id="crit-edit-na-condition" class="form-control" placeholder="Например: запрос не требовал идентификации">
+        </div>
+        <div class="form-group" id="crit-edit-steps-group" style="display: none;">
+          <label>Ступени шкалы (через запятую, верхняя = полный вес):</label>
+          <input type="text" id="crit-edit-steps" class="form-control" placeholder="20, 15, 10, 5, 0">
+        </div>
+        <div class="form-group">
+          <label>Инструкция по оценке:</label>
+          <textarea id="crit-edit-instruction" class="form-control" style="min-height: 60px;"></textarea>
+        </div>
+        <div class="form-group">
+          <label>Правила и уточнения (rules):</label>
+          <textarea id="crit-edit-rules" class="form-control" placeholder="Укажите конкретные правила: когда ставить «нет», когда N/A..." style="min-height: 60px;"></textarea>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" onclick="app.closeModal('criterion-modal')">Отмена</button>
+        <button class="btn-primary" id="btn-save-criterion">Сохранить критерий</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: API CONNECTION (ALIKHAN BACKEND TOGGLE) -->
+  <div class="modal-overlay" id="api-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>Источник данных</h3>
+        <button class="close-btn" onclick="app.closeModal('api-modal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Адрес API сервера:</label>
+          <input type="text" id="api-url-input" class="form-control" placeholder="http://localhost:8000/api">
+          <span id="api-modal-state" style="font-size: 12px; color: var(--text-muted); margin-top: 4px;"></span>
+          <span style="font-size: 11px; color: var(--text-muted); margin-top: 4px;">Если GET /health не отвечает, интерфейс показывает демо-данные с пометкой.</span>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" onclick="app.closeModal('api-modal')">Отмена</button>
+        <button class="btn-primary" id="btn-save-api-config">Подключиться</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- MODAL: DISPLAY THRESHOLDS (settings; not part of the checklist, do not affect scores) -->
+  <div class="modal-overlay" id="settings-modal">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3>Пороги отображения (настройка)</h3>
+        <button class="close-btn" onclick="app.closeModal('settings-modal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <p style="font-size: 12px; color: var(--text-muted);">Этих порогов нет в задании: они только раскрашивают итоги и дашборд и не влияют на баллы.</p>
+        <div class="form-group"><label>«Хорошо» от:</label><input type="number" id="set-good" class="form-control" min="0" max="100"></div>
+        <div class="form-group"><label>«Отлично» от:</label><input type="number" id="set-excellent" class="form-control" min="0" max="100"></div>
+        <div class="form-group"><label>Целевой уровень по критерию, %:</label><input type="number" id="set-target" class="form-control" min="0" max="100"></div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn-secondary" onclick="app.closeModal('settings-modal')">Отмена</button>
+        <button class="btn-primary" id="btn-save-settings">Сохранить</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- SCRIPT INCLUDES -->
+  <!-- Demo data: synthetic, used only when the server is unavailable (web/demo/build_demo.py) -->
+  <script src="demo/demo_data.js"></script>
+  <script src="api.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
