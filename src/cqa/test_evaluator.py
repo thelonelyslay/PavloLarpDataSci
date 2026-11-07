@@ -117,6 +117,18 @@ class EvaluateTest(unittest.TestCase):
                 evaluator.evaluate(RECORD, CHECKLIST, env=ENV)
         self.assertEqual(call.call_count, 1)  # no retries and no next model after the deadline
 
+    def test_effort_from_env(self):
+        with mock.patch("llm.call", return_value=fake_result(model_reply())) as call:
+            evaluator.evaluate(RECORD, CHECKLIST, env=ENV)
+            self.assertEqual(call.call_args[0][5]["effort"], evaluator.DEFAULT_EFFORT)
+            evaluator.evaluate(RECORD, CHECKLIST, env={**ENV, "EVAL_EFFORT": "Medium"})
+            self.assertEqual(call.call_args[0][5]["effort"], "medium")
+            evaluator.evaluate(RECORD, CHECKLIST, env={**ENV, "EVAL_EFFORT": "medium"}, opts={"effort": "high"})
+            self.assertEqual(call.call_args[0][5]["effort"], "high")  # explicit opts win
+        with self.assertRaises(evaluator.EvaluationError) as ctx:
+            evaluator.evaluate(RECORD, CHECKLIST, env={**ENV, "EVAL_EFFORT": "max"})
+        self.assertIn("EVAL_EFFORT", str(ctx.exception))
+
     def test_checklist_by_channel(self):
         call_record = {**RECORD, "conversation_id": "test-call", "channel": "voice call"}
         with mock.patch("llm.call", return_value=fake_result(model_reply())):

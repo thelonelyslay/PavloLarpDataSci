@@ -194,8 +194,8 @@ def main() -> None:
     ap.add_argument("--n-kz", type=int, default=2)
     ap.add_argument("--n-en", type=int, default=1)
     ap.add_argument("--channel", default="agent chat", help='"" = any channel')
-    ap.add_argument("--effort", default="low", choices=["low", "medium", "high", "xhigh", "max"],
-                    help="Claude effort level (Claude models do not accept temperature)")
+    ap.add_argument("--effort", default=None, choices=["low", "medium", "high", "xhigh", "max"],
+                    help="Claude effort level (default: EVAL_EFFORT in .env, else low; Claude takes no temperature)")
     ap.add_argument("--gemini-thinking", default="auto",
                     choices=["auto", "minimal", "low", "medium", "high", "default"],
                     help="Gemini thinkingLevel; auto = lowest level the model accepts, default = model's own")
@@ -235,8 +235,9 @@ def main() -> None:
             print("  -", h)
         sys.exit(1)
 
-    opts = {"effort": args.effort, "gemini_thinking": args.gemini_thinking}
-    print(f"models: {', '.join(s.name for s in specs)}  (Claude: effort={args.effort}, no temperature; "
+    effort = args.effort or evaluator.effort_from_env(env)
+    opts = {"effort": effort, "gemini_thinking": args.gemini_thinking}
+    print(f"models: {', '.join(s.name for s in specs)}  (Claude: effort={effort}, no temperature; "
           f"Gemini: thinking={args.gemini_thinking}; OpenAI: temperature=0)")
     with ThreadPoolExecutor(max_workers=len(specs)) as pool:  # models in parallel, dialogs sequential
         results = list(pool.map(lambda s: run_model(s, env, checklist, dialogs, opts), specs))
