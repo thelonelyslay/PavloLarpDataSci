@@ -6,7 +6,7 @@ import os
 import sqlite3
 from uuid import uuid4
 from html import escape
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -36,11 +36,16 @@ DB_PATH = Path(os.environ.get("CQA_DB_PATH", str(ROOT / "data" / "server.sqlite3
 DEV_PATH = ROOT / "data" / "raw" / "dev.json"
 
 
-def _connect() -> sqlite3.Connection:
+@contextmanager
+def _connect():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(DB_PATH)
     connection.row_factory = sqlite3.Row
-    return connection
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def _init_db() -> None:
@@ -78,6 +83,10 @@ def _init_db() -> None:
             output_tokens INTEGER,
             cost_usd REAL
         )""")
+        columns = {row[1] for row in db.execute("PRAGMA table_info(evaluations)")}
+        if "cache_key" not in columns:
+            db.execute("ALTER TABLE evaluations ADD COLUMN cache_key TEXT")
+        db.execute("CREATE INDEX IF NOT EXISTS evaluation_cache_key ON evaluations(cache_key)")
         db.execute("""CREATE TABLE IF NOT EXISTS appeals (
             id TEXT PRIMARY KEY,
             evaluation_id TEXT NOT NULL REFERENCES evaluations(id),
@@ -230,9 +239,12 @@ def activate_checklist(checklist_id: str) -> dict:
 @app.get("/api/conversations")
 def list_conversations() -> list[dict]:
     with _connect() as db:
-        rows = db.execute("SELECT id, channel, language FROM conversations ORDER BY id").fetchall()
+        rows = db.execute("""SELECT c.id, c.channel, c.language,
+            (SELECT e.total FROM evaluations e WHERE e.conversation_id = c.id
+             ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1) AS total
+            FROM conversations c ORDER BY c.id""").fetchall()
     return [{"id": row["id"], "channel": row["channel"], "language": row["language"],
-             "total": None} for row in rows]
+             "total": row["total"]} for row in rows]
 
 
 @app.get("/api/conversations/{conversation_id}")
@@ -274,3 +286,8 @@ def sync_conversations() -> dict:
     except (HTTPError, URLError, TimeoutError, ValueError, OSError):
         raise HTTPException(status_code=502, detail="Data API import failed") from None
     return {"imported": count}
+
+
+from .evaluations import router as evaluations_router  # noqa: E402
+
+app.include_router(evaluations_router)
