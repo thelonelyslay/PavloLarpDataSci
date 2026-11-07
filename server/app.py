@@ -4,12 +4,14 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from html import escape
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -28,6 +30,7 @@ def _load_env() -> None:
 
 _load_env()
 DB_PATH = Path(os.environ.get("CQA_DB_PATH", str(ROOT / "data" / "server.sqlite3")))
+DEV_PATH = ROOT / "data" / "raw" / "dev.json"
 
 
 def _connect() -> sqlite3.Connection:
@@ -49,13 +52,16 @@ def _init_db() -> None:
 
 
 def import_conversations() -> int:
-    """Fetch the DEV API server-side and upsert its records without logging content."""
+    """Import the private DEV file or fetch the DEV API server-side."""
     url = os.environ.get("DATA_API_URL", "").strip()
-    if not url:
+    if DEV_PATH.exists():
+        payload = json.loads(DEV_PATH.read_text(encoding="utf-8"))
+    elif url:
+        request = Request(url, headers={"Accept": "application/json", "User-Agent": "CQA-server/1.0"})
+        with urlopen(request, timeout=20) as response:
+            payload = json.load(response)
+    else:
         return 0
-    request = Request(url, headers={"Accept": "application/json", "User-Agent": "CQA-server/1.0"})
-    with urlopen(request, timeout=20) as response:
-        payload = json.load(response)
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(payload, dict) or payload.get("isSuccess") is not True or not isinstance(data, dict) or not isinstance(data.get("records"), list):
         raise ValueError("Data API returned an invalid response")
@@ -77,7 +83,7 @@ def import_conversations() -> int:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     _init_db()
-    if os.environ.get("DATA_API_URL", "").strip():
+    if DEV_PATH.exists() or os.environ.get("DATA_API_URL", "").strip():
         try:
             import_conversations()
         except (HTTPError, URLError, TimeoutError, ValueError, OSError) as exc:
@@ -114,10 +120,30 @@ def get_conversation(conversation_id: str) -> dict:
             "transcript": json.loads(row["transcript"]), "audio_url": row["audio_url"]}
 
 
+@app.get("/api/conversations/{conversation_id}/view", response_class=HTMLResponse)
+def view_conversation(conversation_id: str) -> str:
+    """Readable, numbered transcript for a human labeler."""
+    record = get_conversation(conversation_id)
+    heading = escape(conversation_id)
+    rows = []
+    for index, message in enumerate(record["transcript"]):
+        timestamp = escape(str(message.get("timestamp", "")))
+        speaker = escape(str(message.get("speaker", "")))
+        body = escape(str(message.get("text", "")))
+        rows.append(f'<article><strong>#{index} · {timestamp} · {speaker}</strong><p>{body}</p></article>')
+    return ("<!doctype html><html lang='ru'><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<title>{heading}</title><style>body{{font:16px/1.5 system-ui;max-width:850px;"
+            "margin:2rem auto;padding:0 1rem}article{border-bottom:1px solid #ddd;padding:.6rem 0}"
+            "p{white-space:pre-wrap;margin:.3rem 0}</style>"
+            f"<h1>{heading}</h1><p>{escape(record['language'])} · {escape(record['channel'])}</p>"
+            + "".join(rows) + "</html>")
+
+
 @app.post("/api/conversations/sync")
 def sync_conversations() -> dict:
-    if not os.environ.get("DATA_API_URL", "").strip():
-        raise HTTPException(status_code=503, detail="DATA_API_URL is not configured")
+    if not DEV_PATH.exists() and not os.environ.get("DATA_API_URL", "").strip():
+        raise HTTPException(status_code=503, detail="DEV data source is not configured")
     try:
         count = import_conversations()
     except (HTTPError, URLError, TimeoutError, ValueError, OSError):
