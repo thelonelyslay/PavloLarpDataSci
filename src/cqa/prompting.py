@@ -71,6 +71,18 @@ def build_system_prompt(checklist: dict) -> str:
         if c["type"] == "flag":
             lines.append('Ответ "yes" означает, что нарушение найдено.')
         lines.append("Допустимые ответы: " + ", ".join(f'"{o}"' for o in answer_options(c)))
+
+    # Clarifications live in the checklist (criterion["rules"]), so they follow the criterion
+    # when it is edited or replaced in the UI; only the evidence rule is checklist-independent.
+    lines += ["", "Правила оценки:"]
+    for c in criteria_sorted(checklist):
+        rule = (c.get("rules") or "").strip()
+        if rule:
+            lines.append(f"- {c['title']}: {rule}")
+    lines.append(
+        "- Обоснование: укажи конкретную реплику (message_index). Для пропущенного действия укажи место,"
+        " где его ждали. Для N/A напиши в explanation, какое условие N/A выполнено."
+    )
     lines += ["", "Верни только JSON по заданной схеме, без пояснений вне JSON."]
     return "\n".join(lines)
 
