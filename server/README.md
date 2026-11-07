@@ -16,6 +16,8 @@ Start with one command:
 
 Open `http://127.0.0.1:8000/api/health`, `/api/conversations`, or `/docs`. For manual labeling, open `/api/conversations/{id}/view` to see numbered messages. To import again without restarting, call `POST /api/conversations/sync`. The list returns `total: null` until an evaluation is saved. The API keeps transcript order and original timestamps; the zero-based array position is `message_index`.
 
+The browser API base URL is `http://127.0.0.1:8000/api` when the web page runs on the same computer. CORS is enabled for the prototype's HTML/JS interface.
+
 `server.scoring.score_answers(checklist, answers)` calls `src/cqa/scoring.py` directly. `POST /api/evaluations` calls the merged `src/cqa/evaluator.py`, which obtains answers and evidence from a real model before the shared scoring function computes points. Set `EVAL_MODELS` in `.env` to choose the model chain. Model and checklist failures return a saved result with `status: "error"` and an appropriate HTTP error status.
 
 The server also creates SQLite tables for checklists, evaluations, appeals, and decisions. On first startup it imports the chat and call checklists from `src/cqa/`. Use `GET /api/checklists` for versions and `GET /api/checklists/{id}` for a complete checklist. Send an edited complete checklist JSON to `POST /api/checklists` to save a new immutable version; its `id` can identify the version being copied. The new version stays inactive until `POST /api/checklists/{id}/activate`. Each channel has its own active checklist.
