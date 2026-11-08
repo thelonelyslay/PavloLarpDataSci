@@ -34,7 +34,7 @@ from validate_results import CRITERIA_MAP, SCHEMA_VERSION, validate_file
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-DEFAULT_TEAM = "-60HZ"
+DEFAULT_TEAM = "pavloral larpers"
 EXPECT = {"dev": 65, "prod": 10}
 MODE = "external_api"
 
